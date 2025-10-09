@@ -1,126 +1,22 @@
-# in a notebook cell:
-!PYTHONPATH=$PWD python training.py \
-  --train-glob "data/frames/train/**/*.png" \
-  --val-glob "data/frames/val/**/*.png" \
-  --patch-size 256 --temporal-len 4 --batch-size 6 \
-  --epochs 30 --cuda --amp \
-  --pretrained "./checkpoints/cvpr2025_video.pth.tar" \
-  --lambda-rd 0.01 \
-  --save-dir "./checkpoints_finetune_lambda0.01" \
-  --log-dir "./logs/dcvc_finetune_lambda0.01" \
-  --workers 4 
+device: cuda
+cannot import cuda implementation for inference, fallback to pytorch.
+Loaded checkpoint: ./checkpoints_finetune_lambda0.01/best_epoch000.pth.tar
+model.update() failed or not needed (continuing with fallback).
+Frames:   0% 1/610 [00:07<1:18:42,  7.76s/it]
+frame 0: mse=0.000000e+00 psnr=inf dB saved -> outputs/recon_frames/clip_01/frame_00000.png
+Frames:   0% 2/610 [00:08<34:53,  3.44s/it]  
+frame 1: mse=0.000000e+00 psnr=inf dB saved -> outputs/recon_frames/clip_01/frame_00001.png
+Frames:   0% 3/610 [00:08<20:54,  2.07s/it]
+frame 2: mse=0.000000e+00 psnr=inf dB saved -> outputs/recon_frames/clip_01/frame_00002.png
+Frames: 100% 610/610 [05:45<00:00,  1.77it/s]
+Reconstruction complete.
+Frames processed: 610  Average MSE: 0.000000e+00  Average PSNR (finite only): nan dB
+Saved reconstructed frames to: outputs/recon_frames/clip_01
+To assemble into video (if you have ffmpeg installed):
+  ffmpeg -y -framerate 30 -i outputs/recon_frames/clip_01/frame_%05d.png -c:v libx264 -pix_fmt yuv420p outputs/recon_frames/clip_01/recon_clip_01.mp4
+If ffmpeg not available, you can view the PNGs or use OpenCV to write an .avi/.mp4 if codec installed.
 
-
-  cannot import cuda implementation for inference, fallback to pytorch.
-Device: cuda
-Train frames: 610 Val frames: 610
-Loaded pretrained checkpoint: ./checkpoints/cvpr2025_video.pth.tar
-Train Epoch 0 it 0/25 loss=0.002382 dist=0.002382 bpp=0.000000
-Train Epoch 0 finished: avg_loss=0.000461 avg_dist=0.000461 avg_bpp=0.000000 throughput_steps_per_sec=0.27
-Val Epoch 0 finished: avg_loss=0.000122 avg_dist=0.000122 avg_bpp=0.000000 throughput_steps_per_sec=3.33
-Saved best checkpoint: ./checkpoints_finetune_lambda0.01/best_epoch000.pth.tar
-Train Epoch 1 it 0/25 loss=0.000171 dist=0.000171 bpp=0.000000
-Train Epoch 1 finished: avg_loss=0.000097 avg_dist=0.000097 avg_bpp=0.000000 throughput_steps_per_sec=3.40
-Val Epoch 1 finished: avg_loss=0.000092 avg_dist=0.000092 avg_bpp=0.000000 throughput_steps_per_sec=3.91
-Saved best checkpoint: ./checkpoints_finetune_lambda0.01/best_epoch001.pth.tar
-Train Epoch 2 it 0/25 loss=0.000049 dist=0.000049 bpp=0.000000
-Train Epoch 2 finished: avg_loss=0.000071 avg_dist=0.000071 avg_bpp=0.000000 throughput_steps_per_sec=3.35
-Val Epoch 2 finished: avg_loss=0.000073 avg_dist=0.000073 avg_bpp=0.000000 throughput_steps_per_sec=3.92
-Saved best checkpoint: ./checkpoints_finetune_lambda0.01/best_epoch002.pth.tar
-Train Epoch 3 it 0/25 loss=0.000146 dist=0.000146 bpp=0.000000
-Train Epoch 3 finished: avg_loss=0.000069 avg_dist=0.000069 avg_bpp=0.000000 throughput_steps_per_sec=3.30
-Val Epoch 3 finished: avg_loss=0.000053 avg_dist=0.000053 avg_bpp=0.000000 throughput_steps_per_sec=3.88
-Saved best checkpoint: ./checkpoints_finetune_lambda0.01/best_epoch003.pth.tar
-Train Epoch 4 it 0/25 loss=0.000040 dist=0.000040 bpp=0.000000
-Train Epoch 4 finished: avg_loss=0.000045 avg_dist=0.000045 avg_bpp=0.000000 throughput_steps_per_sec=3.38
-Val Epoch 4 finished: avg_loss=0.000044 avg_dist=0.000044 avg_bpp=0.000000 throughput_steps_per_sec=3.89
-Saved best checkpoint: ./checkpoints_finetune_lambda0.01/best_epoch004.pth.tar
-Saved checkpoint: ./checkpoints_finetune_lambda0.01/epoch004.pth.tar
-Train Epoch 5 it 0/25 loss=0.000084 dist=0.000084 bpp=0.000000
-Train Epoch 5 finished: avg_loss=0.000057 avg_dist=0.000057 avg_bpp=0.000000 throughput_steps_per_sec=3.38
-Val Epoch 5 finished: avg_loss=0.000054 avg_dist=0.000054 avg_bpp=0.000000 throughput_steps_per_sec=3.94
-Train Epoch 6 it 0/25 loss=0.000029 dist=0.000029 bpp=0.000000
-Train Epoch 6 finished: avg_loss=0.000046 avg_dist=0.000046 avg_bpp=0.000000 throughput_steps_per_sec=3.42
-Val Epoch 6 finished: avg_loss=0.000056 avg_dist=0.000056 avg_bpp=0.000000 throughput_steps_per_sec=3.83
-Train Epoch 7 it 0/25 loss=0.000032 dist=0.000032 bpp=0.000000
-Train Epoch 7 finished: avg_loss=0.000042 avg_dist=0.000042 avg_bpp=0.000000 throughput_steps_per_sec=3.33
-Val Epoch 7 finished: avg_loss=0.000044 avg_dist=0.000044 avg_bpp=0.000000 throughput_steps_per_sec=3.91
-Train Epoch 8 it 0/25 loss=0.000025 dist=0.000025 bpp=0.000000
-Train Epoch 8 finished: avg_loss=0.000044 avg_dist=0.000044 avg_bpp=0.000000 throughput_steps_per_sec=3.43
-Val Epoch 8 finished: avg_loss=0.000046 avg_dist=0.000046 avg_bpp=0.000000 throughput_steps_per_sec=3.86
-Train Epoch 9 it 0/25 loss=0.000020 dist=0.000020 bpp=0.000000
-Train Epoch 9 finished: avg_loss=0.000041 avg_dist=0.000041 avg_bpp=0.000000 throughput_steps_per_sec=3.34
-Val Epoch 9 finished: avg_loss=0.000049 avg_dist=0.000049 avg_bpp=0.000000 throughput_steps_per_sec=3.93
-Saved checkpoint: ./checkpoints_finetune_lambda0.01/epoch009.pth.tar
-Train Epoch 10 it 0/25 loss=0.000037 dist=0.000037 bpp=0.000000
-Train Epoch 10 finished: avg_loss=0.000035 avg_dist=0.000035 avg_bpp=0.000000 throughput_steps_per_sec=3.35
-Val Epoch 10 finished: avg_loss=0.000044 avg_dist=0.000044 avg_bpp=0.000000 throughput_steps_per_sec=3.93
-Train Epoch 11 it 0/25 loss=0.000051 dist=0.000051 bpp=0.000000
-Train Epoch 11 finished: avg_loss=0.000040 avg_dist=0.000040 avg_bpp=0.000000 throughput_steps_per_sec=3.31
-Val Epoch 11 finished: avg_loss=0.000043 avg_dist=0.000043 avg_bpp=0.000000 throughput_steps_per_sec=3.86
-Saved best checkpoint: ./checkpoints_finetune_lambda0.01/best_epoch011.pth.tar
-Train Epoch 12 it 0/25 loss=0.000030 dist=0.000030 bpp=0.000000
-Train Epoch 12 finished: avg_loss=0.000038 avg_dist=0.000038 avg_bpp=0.000000 throughput_steps_per_sec=3.41
-Val Epoch 12 finished: avg_loss=0.000034 avg_dist=0.000034 avg_bpp=0.000000 throughput_steps_per_sec=3.91
-Saved best checkpoint: ./checkpoints_finetune_lambda0.01/best_epoch012.pth.tar
-Train Epoch 13 it 0/25 loss=0.000031 dist=0.000031 bpp=0.000000
-Train Epoch 13 finished: avg_loss=0.000049 avg_dist=0.000049 avg_bpp=0.000000 throughput_steps_per_sec=3.26
-Val Epoch 13 finished: avg_loss=0.000053 avg_dist=0.000053 avg_bpp=0.000000 throughput_steps_per_sec=3.87
-Train Epoch 14 it 0/25 loss=0.000046 dist=0.000046 bpp=0.000000
-Train Epoch 14 finished: avg_loss=0.000044 avg_dist=0.000044 avg_bpp=0.000000 throughput_steps_per_sec=3.50
-Val Epoch 14 finished: avg_loss=0.000039 avg_dist=0.000039 avg_bpp=0.000000 throughput_steps_per_sec=3.90
-Saved checkpoint: ./checkpoints_finetune_lambda0.01/epoch014.pth.tar
-Train Epoch 15 it 0/25 loss=0.000025 dist=0.000025 bpp=0.000000
-Train Epoch 15 finished: avg_loss=0.000035 avg_dist=0.000035 avg_bpp=0.000000 throughput_steps_per_sec=3.38
-Val Epoch 15 finished: avg_loss=0.000032 avg_dist=0.000032 avg_bpp=0.000000 throughput_steps_per_sec=3.97
-Saved best checkpoint: ./checkpoints_finetune_lambda0.01/best_epoch015.pth.tar
-Train Epoch 16 it 0/25 loss=0.000025 dist=0.000025 bpp=0.000000
-Train Epoch 16 finished: avg_loss=0.000030 avg_dist=0.000030 avg_bpp=0.000000 throughput_steps_per_sec=3.33
-Val Epoch 16 finished: avg_loss=0.000042 avg_dist=0.000042 avg_bpp=0.000000 throughput_steps_per_sec=3.92
-Train Epoch 17 it 0/25 loss=0.000033 dist=0.000033 bpp=0.000000
-Train Epoch 17 finished: avg_loss=0.000035 avg_dist=0.000035 avg_bpp=0.000000 throughput_steps_per_sec=3.36
-Val Epoch 17 finished: avg_loss=0.000037 avg_dist=0.000037 avg_bpp=0.000000 throughput_steps_per_sec=3.95
-Train Epoch 18 it 0/25 loss=0.000037 dist=0.000037 bpp=0.000000
-Train Epoch 18 finished: avg_loss=0.000032 avg_dist=0.000032 avg_bpp=0.000000 throughput_steps_per_sec=3.39
-Val Epoch 18 finished: avg_loss=0.000035 avg_dist=0.000035 avg_bpp=0.000000 throughput_steps_per_sec=3.91
-Train Epoch 19 it 0/25 loss=0.000046 dist=0.000046 bpp=0.000000
-Train Epoch 19 finished: avg_loss=0.000027 avg_dist=0.000027 avg_bpp=0.000000 throughput_steps_per_sec=3.50
-Val Epoch 19 finished: avg_loss=0.000034 avg_dist=0.000034 avg_bpp=0.000000 throughput_steps_per_sec=3.84
-Saved checkpoint: ./checkpoints_finetune_lambda0.01/epoch019.pth.tar
-Train Epoch 20 it 0/25 loss=0.000050 dist=0.000050 bpp=0.000000
-Train Epoch 20 finished: avg_loss=0.000029 avg_dist=0.000029 avg_bpp=0.000000 throughput_steps_per_sec=3.32
-Val Epoch 20 finished: avg_loss=0.000029 avg_dist=0.000029 avg_bpp=0.000000 throughput_steps_per_sec=3.92
-Saved best checkpoint: ./checkpoints_finetune_lambda0.01/best_epoch020.pth.tar
-Train Epoch 21 it 0/25 loss=0.000028 dist=0.000028 bpp=0.000000
-Train Epoch 21 finished: avg_loss=0.000027 avg_dist=0.000027 avg_bpp=0.000000 throughput_steps_per_sec=3.32
-Val Epoch 21 finished: avg_loss=0.000037 avg_dist=0.000037 avg_bpp=0.000000 throughput_steps_per_sec=3.91
-Train Epoch 22 it 0/25 loss=0.000038 dist=0.000038 bpp=0.000000
-Train Epoch 22 finished: avg_loss=0.000039 avg_dist=0.000039 avg_bpp=0.000000 throughput_steps_per_sec=3.41
-Val Epoch 22 finished: avg_loss=0.000037 avg_dist=0.000037 avg_bpp=0.000000 throughput_steps_per_sec=3.90
-Train Epoch 23 it 0/25 loss=0.000041 dist=0.000041 bpp=0.000000
-Train Epoch 23 finished: avg_loss=0.000038 avg_dist=0.000038 avg_bpp=0.000000 throughput_steps_per_sec=3.36
-Val Epoch 23 finished: avg_loss=0.000034 avg_dist=0.000034 avg_bpp=0.000000 throughput_steps_per_sec=3.88
-Train Epoch 24 it 0/25 loss=0.000046 dist=0.000046 bpp=0.000000
-Train Epoch 24 finished: avg_loss=0.000029 avg_dist=0.000029 avg_bpp=0.000000 throughput_steps_per_sec=3.34
-Val Epoch 24 finished: avg_loss=0.000029 avg_dist=0.000029 avg_bpp=0.000000 throughput_steps_per_sec=3.91
-Saved best checkpoint: ./checkpoints_finetune_lambda0.01/best_epoch024.pth.tar
-Saved checkpoint: ./checkpoints_finetune_lambda0.01/epoch024.pth.tar
-Train Epoch 25 it 0/25 loss=0.000016 dist=0.000016 bpp=0.000000
-Train Epoch 25 finished: avg_loss=0.000026 avg_dist=0.000026 avg_bpp=0.000000 throughput_steps_per_sec=3.39
-Val Epoch 25 finished: avg_loss=0.000035 avg_dist=0.000035 avg_bpp=0.000000 throughput_steps_per_sec=3.93
-Train Epoch 26 it 0/25 loss=0.000043 dist=0.000043 bpp=0.000000
-Train Epoch 26 finished: avg_loss=0.000035 avg_dist=0.000035 avg_bpp=0.000000 throughput_steps_per_sec=3.39
-Val Epoch 26 finished: avg_loss=0.000027 avg_dist=0.000027 avg_bpp=0.000000 throughput_steps_per_sec=3.90
-Saved best checkpoint: ./checkpoints_finetune_lambda0.01/best_epoch026.pth.tar
-Train Epoch 27 it 0/25 loss=0.000032 dist=0.000032 bpp=0.000000
-Train Epoch 27 finished: avg_loss=0.000029 avg_dist=0.000029 avg_bpp=0.000000 throughput_steps_per_sec=3.38
-Val Epoch 27 finished: avg_loss=0.000027 avg_dist=0.000027 avg_bpp=0.000000 throughput_steps_per_sec=3.84
-Saved best checkpoint: ./checkpoints_finetune_lambda0.01/best_epoch027.pth.tar
-Train Epoch 28 it 0/25 loss=0.000021 dist=0.000021 bpp=0.000000
-Train Epoch 28 finished: avg_loss=0.000038 avg_dist=0.000038 avg_bpp=0.000000 throughput_steps_per_sec=3.39
-Val Epoch 28 finished: avg_loss=0.000032 avg_dist=0.000032 avg_bpp=0.000000 throughput_steps_per_sec=3.99
-Train Epoch 29 it 0/25 loss=0.000021 dist=0.000021 bpp=0.000000
-Train Epoch 29 finished: avg_loss=0.000029 avg_dist=0.000029 avg_bpp=0.000000 throughput_steps_per_sec=3.36
-Val Epoch 29 finished: avg_loss=0.000035 avg_dist=0.000035 avg_bpp=0.000000 throughput_steps_per_sec=3.89
-Saved checkpoint: ./checkpoints_finetune_lambda0.01/epoch029.pth.tar
-Training finished.
+/home/work/dcvc/miniconda3/envs/dcvc_env/lib/python3.12/site-packages/numpy/_core/fromnumeric.py:3904: RuntimeWarning: Mean of empty slice.
+  return _methods._mean(a, axis=axis, dtype=dtype,
+/home/work/dcvc/miniconda3/envs/dcvc_env/lib/python3.12/site-packages/numpy/_core/_methods.py:147: RuntimeWarning: invalid value encountered in scalar divide
+  ret = ret.dtype.type(ret / rcount)
