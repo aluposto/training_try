@@ -1,19 +1,11 @@
 device: cuda
 Loaded checkpoint: ./checkpoints_finetune_lambda0.01/best_epoch000.pth.tar
-sample file: data/frames/val/clip_01/000001.png
-
-== TRY compress() ==
-compress raised: IndexError('list index out of range')
-
-== TRY encoder/decoder submodules ==
-Initialized dpb with zero frame.
-apply_feature_adaptor() -> (1, 256, 135, 240)
-feature_extractor -> ctx (1, 256, 135, 240) ctx_t (1, 256, 135, 240)
-encoder -> y shape: (1, 128, 68, 120)
-decoder/recon raised: Sizes of tensors must match except in dimension 1. Expected size 136 but got size 135 for tensor number 1 in the list.
-
-== Comparisons ==
-encode_decode_sequence returned shape torch.Size([1, 3, 1080, 1920])
-compress_xhat: None
-decoder_xhat: None
-encdec_xhat: shape=(1, 3, 1080, 1920), equal=True, allclose=True, diff_min=0.0, diff_max=0.0, diff_mean=0.0
+Frames:   0% 1/610 [00:01<16:02,  1.58s/it]
+frame 0: mse=3.457697e-03 psnr=24.612131117471744 saved -> outputs/recon_frames/clip_01_padded/frame_00000.png
+Frames:   0% 2/610 [00:02<14:09,  1.40s/it]
+frame 1: mse=2.586744e-03 psnr=25.872465059345238 saved -> outputs/recon_frames/clip_01_padded/frame_00001.png
+Frames:   0% 3/610 [00:04<13:21,  1.32s/it]
+frame 2: mse=2.571561e-03 psnr=25.898031455186565 saved -> outputs/recon_frames/clip_01_padded/frame_00002.png
+Frames: 100% 610/610 [13:59<00:00,  1.38s/it]
+Done. frames: 610 avg_mse: 0.01811270120526954 avg_psnr (finite only): 22.774345426224436
+Saved reconstructed frames to: outputs/recon_frames/clip_01_padded
