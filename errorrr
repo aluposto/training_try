@@ -1,0 +1,19 @@
+device: cuda
+Loaded checkpoint: ./checkpoints_finetune_lambda0.01/best_epoch000.pth.tar
+sample file: data/frames/val/clip_01/000001.png
+
+== TRY compress() ==
+compress raised: IndexError('list index out of range')
+
+== TRY encoder/decoder submodules ==
+Initialized dpb with zero frame.
+apply_feature_adaptor() -> (1, 256, 135, 240)
+feature_extractor -> ctx (1, 256, 135, 240) ctx_t (1, 256, 135, 240)
+encoder -> y shape: (1, 128, 68, 120)
+decoder/recon raised: Sizes of tensors must match except in dimension 1. Expected size 136 but got size 135 for tensor number 1 in the list.
+
+== Comparisons ==
+encode_decode_sequence returned shape torch.Size([1, 3, 1080, 1920])
+compress_xhat: None
+decoder_xhat: None
+encdec_xhat: shape=(1, 3, 1080, 1920), equal=True, allclose=True, diff_min=0.0, diff_max=0.0, diff_mean=0.0
