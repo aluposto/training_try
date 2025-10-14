@@ -1,22 +1,22 @@
-# live_padded_reconstruct_clip.py (for Jupyter notebook)
-import os, math, glob, time
+# padded_reconstruct_clip.py with live PSNR plot (minimal changes)
+import os, math, glob, tqdm
 import numpy as np
 from PIL import Image
 import torch
 import torch.nn.functional as F
 from src.models.video_model import DMC as VideoModel
 
-# display helpers
+# --- Live plotting imports (added only) ---
 from IPython.display import display, clear_output
 import matplotlib
-# prefer inline backend (not required if you already have it)
 matplotlib.use('module://matplotlib_inline.backend_inline')
 import matplotlib.pyplot as plt
+# ------------------------------------------------
 
 # Paths - edit if needed
 ckpt_path = "./checkpoints_finetune_lambda0.01/best_epoch010.pth.tar"
 frames_dir = "data/frames/train/clip_01"   # update as needed
-out_dir = "outputs/recon_frames/clip_01_padded_live"
+out_dir = "outputs/recon_frames/clip_01_padded"
 os.makedirs(out_dir, exist_ok=True)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -32,26 +32,41 @@ if os.path.exists(ckpt_path):
 else:
     print("Warning: checkpoint not found:", ckpt_path)
 
+# Helper: PSNR
 def mse_to_psnr(mse, max_val=1.0):
-    if not np.isfinite(mse): return float('nan')
-    if mse == 0: return float('inf')
+    if mse <= 0:
+        return float("inf")
     return 10.0 * math.log10((max_val**2) / mse)
 
-# get frames
+# helper to compute padding so H and W become multiples of 16
+def get_pad_amount(height, width, mult=16):
+    pad_h = (mult - (height % mult)) % mult
+    pad_w = (mult - (width % mult)) % mult
+    # pad format for torch.nn.functional.pad: (left, right, top, bottom)
+    left = 0
+    right = pad_w
+    top = 0
+    bottom = pad_h
+    return (left, right, top, bottom)
+
+# get frame list
 frame_paths = sorted(glob.glob(os.path.join(frames_dir, "*.png")))
 if len(frame_paths) == 0:
     raise SystemExit(f"No frames found in {frames_dir}")
 
-# init dpb
+# initialize dpb
 try:
     model.clear_dpb()
 except Exception:
     model.dpb = []
+# We'll initialize dpb with a zero frame of the padded size for the first frame; created inside loop
 
 psnr_list = []
 mse_list = []
 
-# Prepare a figure once
+# -------------------------
+# Initialize live PSNR plot
+# -------------------------
 fig, ax = plt.subplots(figsize=(10,3))
 ax.set_title("PSNR per frame (live)")
 ax.set_xlabel("frame index")
@@ -60,20 +75,29 @@ ax.grid(True)
 line, = ax.plot([], [], marker='o', markersize=2)
 ax.set_xlim(0, max(10, len(frame_paths)))
 ax.set_ylim(0, 50)
-display(fig)   # show initial empty figure
+display(fig)
+# -------------------------
 
-start_time = time.time()
-for i, p in enumerate(frame_paths):
+for i, p in enumerate(tqdm.tqdm(frame_paths, desc="Frames")):
     im = Image.open(p).convert("RGB")
     arr = np.asarray(im, dtype=np.float32)/255.0
     H, W = arr.shape[0], arr.shape[1]
+    # compute pad to multiple of 16
+    left, right, top, bottom = get_pad_amount(H, W, mult=16)  # WATCH: we will pad height/width accordingly but F.pad expects (left,right,top,bottom)
+    # Note: arr shape is (H,W,3). We'll convert to tensor [1,C,H,W] then pad.
+    x = torch.from_numpy(arr.transpose(2,0,1))[None,...].to(device)  # [1,C,H,W]
+
+    # We computed pad amounts assuming (height, width) -> but F.pad takes (left,right,top,bottom) for last two dims.
+    # So compute right/bottom correctly:
     pad_h = (16 - (H % 16)) % 16
     pad_w = (16 - (W % 16)) % 16
-    pad = (0, pad_w, 0, pad_h)
-    x = torch.from_numpy(arr.transpose(2,0,1))[None,...].to(device)
-    x_padded = F.pad(x, pad, mode='replicate') if (pad_w or pad_h) else x
+    pad = (0, pad_w, 0, pad_h)  # (left, right, top, bottom)
+    if pad_w != 0 or pad_h != 0:
+        x_padded = F.pad(x, pad, mode='replicate')  # replicate pad is safe
+    else:
+        x_padded = x
 
-    # init dpb zero frame to padded size for first frame
+    # For first frame ensure dpb has a zero frame with same padded dims
     if i == 0:
         zeros = torch.zeros_like(x_padded)
         try:
@@ -83,20 +107,21 @@ for i, p in enumerate(frame_paths):
         try:
             model.add_ref_frame(frame=zeros, increase_poc=False)
         except Exception:
+            # some variants expect different signature
             try:
                 model.add_ref_frame(feature=None, frame=zeros, increase_poc=False)
             except Exception:
+                # fallback: set dpb directly
                 model.dpb = []
-                try:
-                    model.add_ref_frame(frame=zeros, increase_poc=False)
-                except Exception:
-                    pass
+                model.add_ref_frame(frame=zeros, increase_poc=False)
 
-    # inference (best-effort differentiable path)
+    # run best-effort differentiable encode-decode path (no entropy coder)
     with torch.no_grad():
+        # apply feature adaptor (uses dpb[0])
         try:
             feat_adapt = model.apply_feature_adaptor()
         except Exception:
+            # fallback: run feature_adaptor_i on pixel_unshuffle of padded input
             try:
                 feat_in = F.pixel_unshuffle(x_padded, 8)
             except Exception:
@@ -106,6 +131,7 @@ for i, p in enumerate(frame_paths):
             except Exception:
                 feat_adapt = feat_in
 
+        # feature_extractor
         ctx = None; ctx_t = None
         if hasattr(model, "feature_extractor"):
             try:
@@ -114,6 +140,7 @@ for i, p in enumerate(frame_paths):
             except Exception:
                 ctx, ctx_t = (None, None)
 
+        # encoder
         y = None
         if hasattr(model, "encoder"):
             try:
@@ -122,6 +149,7 @@ for i, p in enumerate(frame_paths):
             except Exception:
                 y = None
 
+        # decoder + recon net
         x_hat_padded = x_padded
         if y is not None and hasattr(model, "decoder") and hasattr(model, "recon_generation_net"):
             try:
@@ -129,7 +157,7 @@ for i, p in enumerate(frame_paths):
                 q_recon = model.q_recon[0:1] if hasattr(model,"q_recon") else None
                 feat_dec = model.decoder(y, ctx if ctx is not None else feat_adapt, q_dec)
                 x_hat_padded = model.recon_generation_net(feat_dec, q_recon).clamp(0,1)
-                # update dpb
+                # update dpb for next frame
                 try:
                     model.add_ref_frame(feature=feat_dec, frame=x_hat_padded, increase_poc=True)
                 except Exception:
@@ -137,52 +165,52 @@ for i, p in enumerate(frame_paths):
                         model.add_ref_frame(frame=x_hat_padded, increase_poc=True)
                     except Exception:
                         pass
-            except Exception:
+            except Exception as e:
+                # fallback identity if decoder fails
+                # print("decoder failed:", e)
                 x_hat_padded = x_padded
 
-    x_hat = x_hat_padded[..., :H, :W]
-
-    # sanitize numerical issues
-    x_hat_np = x_hat[0].cpu().numpy().transpose(1,2,0)
-    x_hat_np = np.nan_to_num(x_hat_np, nan=0.0, posinf=1.0, neginf=0.0)
-    x_hat_np = np.clip(x_hat_np, 0.0, 1.0)
-    x_hat = torch.from_numpy(x_hat_np.transpose(2,0,1))[None].to(device)
+    # crop back to original H,W
+    x_hat = x_hat_padded[..., :H, :W]  # crop bottom/right if padded
 
     mse = F.mse_loss(x_hat, x, reduction="mean").item()
     psnr = mse_to_psnr(mse)
     mse_list.append(mse)
     psnr_list.append(psnr)
 
-    # save small preview if you want
-    out_np = (x_hat_np * 255.0).round().astype(np.uint8)
+    # save reconstructed frame (clipped)
+    out_np = (x_hat[0].cpu().numpy().transpose(1,2,0) * 255.0).round().astype(np.uint8)
     Image.fromarray(out_np).save(os.path.join(out_dir, f"frame_{i:05d}.png"))
 
-    # --- UPDATE LIVE PLOT by re-drawing and forcing notebook to display it ---
-    line.set_xdata(np.arange(len(psnr_list)))
-    line.set_ydata(np.array(psnr_list))
-    ax.relim()
-    ax.autoscale_view()
-    # draw canvas
-    fig.canvas.draw()
-    # clear previous output and display updated figure (real-time effect)
-    clear_output(wait=True)
-    display(fig)
+    if i < 3:
+        print(f"frame {i}: mse={mse:.6e} psnr={psnr if psnr!=float('inf') else 'inf'} saved -> {os.path.join(out_dir, f'frame_{i:05d}.png')}")
 
-    # small pause to allow UI loop to refresh (0.01 is usually enough)
-    plt.pause(0.01)
+    # -------------------------
+    # Update live PSNR plot (added only)
+    # -------------------------
+    try:
+        line.set_xdata(np.arange(len(psnr_list)))
+        line.set_ydata(np.array(psnr_list))
+        ax.relim()
+        ax.autoscale_view()
+        clear_output(wait=True)
+        display(fig)
+        plt.pause(0.001)
+    except Exception:
+        # non-fatal: continue without plotting if update fails
+        pass
+    # -------------------------
 
-    # optional small log
-    if i % 50 == 0:
-        elapsed = time.time() - start_time
-        print(f"frame {i}/{len(frame_paths)}  psnr={psnr:.2f}  avg_psnr={(np.nanmean(psnr_list)):.2f}  elapsed={elapsed:.1f}s")
-
-# end loop
-plt.ioff()
-# final save of the PSNR plot
+# summary
 finite_psnrs = [p for p in psnr_list if np.isfinite(p)]
 avg_mse = float(np.mean(mse_list))
 avg_psnr = float(np.mean(finite_psnrs)) if len(finite_psnrs)>0 else float('nan')
 print("Done. frames:", len(frame_paths), "avg_mse:", avg_mse, "avg_psnr (finite only):", avg_psnr)
-plot_path = os.path.join(out_dir, "psnr_over_time.png")
-fig.savefig(plot_path)
-print("Saved PSNR plot to:", plot_path)
+print("Saved reconstructed frames to:", out_dir)
+
+# Save final PSNR plot
+try:
+    fig.savefig(os.path.join(out_dir, "psnr_over_time.png"))
+    print("Saved PSNR plot to:", os.path.join(out_dir, "psnr_over_time.png"))
+except Exception:
+    pass
