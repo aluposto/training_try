@@ -1,36 +1,29 @@
-# Notebook / script cell: reconstruct a clip (differentiable fallback path) and compute PSNR
+# padded_reconstruct_clip.py (paste in notebook cell)
 import os, math, glob, tqdm
 import numpy as np
 from PIL import Image
 import torch
 import torch.nn.functional as F
+from src.models.video_model import DMC as VideoModel
 
 # Paths - edit if needed
-ckpt_path = "./checkpoints_finetune_lambda0.01/best_epoch000.pth.tar"   # or the checkpoint you want
-frames_dir = "data/frames/train/clip_01"   # input frames (PNG) — update to your path
-out_dir = "outputs/recon_frames/clip_01"   # where reconstructions will be saved
+ckpt_path = "./checkpoints_finetune_lambda0.01/best_epoch010.pth.tar"
+frames_dir = "data/frames/train/clip_01"   # update as needed
+out_dir = "outputs/recon_frames/clip_01_padded"
 os.makedirs(out_dir, exist_ok=True)
 
-# Device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("device:", device)
 
 # Load model
-from src.models.video_model import DMC as VideoModel
-model = VideoModel().to(device)
-model.eval()
-
-# Load checkpoint weights (non-strict to allow missing keys)
+model = VideoModel().to(device).eval()
 if os.path.exists(ckpt_path):
     ck = torch.load(ckpt_path, map_location="cpu")
     sd = ck.get("state_dict", ck)
-    try:
-        model.load_state_dict({k.replace("module.",""): v for k,v in sd.items()}, strict=False)
-        print("Loaded checkpoint:", ckpt_path)
-    except Exception as e:
-        print("Warning: partial load failed:", e)
+    model.load_state_dict({k.replace("module.",""): v for k,v in sd.items()}, strict=False)
+    print("Loaded checkpoint:", ckpt_path)
 else:
-    print("Warning: checkpoint not found at", ckpt_path)
+    print("Warning: checkpoint not found:", ckpt_path)
 
 # Helper: PSNR
 def mse_to_psnr(mse, max_val=1.0):
@@ -38,137 +31,142 @@ def mse_to_psnr(mse, max_val=1.0):
         return float("inf")
     return 10.0 * math.log10((max_val**2) / mse)
 
-# Prepare frame list (sorted)
+# helper to compute padding so H and W become multiples of 16
+def get_pad_amount(height, width, mult=16):
+    pad_h = (mult - (height % mult)) % mult
+    pad_w = (mult - (width % mult)) % mult
+    # pad format for torch.nn.functional.pad: (left, right, top, bottom)
+    left = 0
+    right = pad_w
+    top = 0
+    bottom = pad_h
+    return (left, right, top, bottom)
+
+# get frame list
 frame_paths = sorted(glob.glob(os.path.join(frames_dir, "*.png")))
 if len(frame_paths) == 0:
     raise SystemExit(f"No frames found in {frames_dir}")
 
-# OPTIONAL: initialize model.entropy coder if available (safe)
-try:
-    model.update()
-    print("model.update() succeeded (entropy coder initialized).")
-except Exception:
-    # it's OK if this fails; fallback path still works
-    print("model.update() failed or not needed (continuing with fallback).")
-
-# We'll use the same strategy used earlier in training wrapper:
-# - initialize DPB with a zero frame
-# - for each frame: run apply_feature_adaptor / feature_extractor / encoder / decoder / recon_generation_net
-# - update dpb with new feature and reconstruction
-
-# ensure dpb is cleared
+# initialize dpb
 try:
     model.clear_dpb()
 except Exception:
-    # best-effort: set attribute if absent
     model.dpb = []
+# We'll initialize dpb with a zero frame of the padded size for the first frame; created inside loop
 
-# Add an initial zero ref frame (so model.apply_feature_adaptor() can call pixel_unshuffle safely)
-# pick resolution from first frame
-im0 = Image.open(frame_paths[0]).convert("RGB")
-W,H = im0.size
-# convert to tensor [1,C,H,W]
-arr0 = (np.asarray(im0, dtype=np.float32) / 255.0).transpose(2,0,1)[None,...]
-zeros = torch.from_numpy(np.zeros_like(arr0)).to(device)
-# Try to add as a reference frame; different signatures handled
-try:
-    model.add_ref_frame(feature=None, frame=zeros, increase_poc=False)
-except TypeError:
-    try:
-        model.add_ref_frame(frame=zeros, increase_poc=False)
-    except Exception:
-        # last resort
-        model.dpb = []
-        model.add_ref_frame(frame=zeros, increase_poc=False)
-
-# Iterate frames and reconstruct
 psnr_list = []
 mse_list = []
+
 for i, p in enumerate(tqdm.tqdm(frame_paths, desc="Frames")):
     im = Image.open(p).convert("RGB")
-    arr = np.asarray(im, dtype=np.float32) / 255.0
+    arr = np.asarray(im, dtype=np.float32)/255.0
+    H, W = arr.shape[0], arr.shape[1]
+    # compute pad to multiple of 16
+    left, right, top, bottom = get_pad_amount(H, W, mult=16)  # WATCH: we will pad height/width accordingly but F.pad expects (left,right,top,bottom)
+    # Note: arr shape is (H,W,3). We'll convert to tensor [1,C,H,W] then pad.
     x = torch.from_numpy(arr.transpose(2,0,1))[None,...].to(device)  # [1,C,H,W]
 
-    # Best-effort differentiable reconstruction path (same logic as training fallback)
+    # We computed pad amounts assuming (height, width) -> but F.pad takes (left,right,top,bottom) for last two dims.
+    # So compute right/bottom correctly:
+    pad_h = (16 - (H % 16)) % 16
+    pad_w = (16 - (W % 16)) % 16
+    pad = (0, pad_w, 0, pad_h)  # (left, right, top, bottom)
+    if pad_w != 0 or pad_h != 0:
+        x_padded = F.pad(x, pad, mode='replicate')  # replicate pad is safe
+    else:
+        x_padded = x
+
+    # For first frame ensure dpb has a zero frame with same padded dims
+    if i == 0:
+        zeros = torch.zeros_like(x_padded)
+        try:
+            model.clear_dpb()
+        except Exception:
+            model.dpb = []
+        try:
+            model.add_ref_frame(frame=zeros, increase_poc=False)
+        except Exception:
+            # some variants expect different signature
+            try:
+                model.add_ref_frame(feature=None, frame=zeros, increase_poc=False)
+            except Exception:
+                # fallback: set dpb directly
+                model.dpb = []
+                model.add_ref_frame(frame=zeros, increase_poc=False)
+
+    # run best-effort differentiable encode-decode path (no entropy coder)
     with torch.no_grad():
-        # ensure we can call apply_feature_adaptor (it relies on dpb[0].frame or dpb[0].feature)
+        # apply feature adaptor (uses dpb[0])
         try:
             feat_adapt = model.apply_feature_adaptor()
         except Exception:
-            # fallback: do pixel_unshuffle and use feature_adaptor_i if present
+            # fallback: run feature_adaptor_i on pixel_unshuffle of padded input
             try:
-                feat_in = F.pixel_unshuffle(x, 8)
+                feat_in = F.pixel_unshuffle(x_padded, 8)
             except Exception:
-                feat_in = x
-            if hasattr(model, "feature_adaptor_i"):
-                try:
-                    feat_adapt = model.feature_adaptor_i(feat_in)
-                except Exception:
-                    feat_adapt = feat_in
-            else:
+                feat_in = x_padded
+            try:
+                feat_adapt = model.feature_adaptor_i(feat_in)
+            except Exception:
                 feat_adapt = feat_in
 
-        # feature_extractor -> ctx, ctx_t
+        # feature_extractor
         ctx = None; ctx_t = None
         if hasattr(model, "feature_extractor"):
             try:
-                qf = model.q_feature[0:1] if hasattr(model, "q_feature") else None
+                qf = model.q_feature[0:1] if hasattr(model,"q_feature") else None
                 ctx, ctx_t = model.feature_extractor(feat_adapt, qf)
             except Exception:
-                ctx = None; ctx_t = None
+                ctx, ctx_t = (None, None)
 
-        # encoder -> y
+        # encoder
         y = None
         if hasattr(model, "encoder"):
             try:
-                q_enc = model.q_encoder[0:1] if hasattr(model, "q_encoder") else None
-                y = model.encoder(x, ctx if ctx is not None else feat_adapt, q_enc)
+                q_enc = model.q_encoder[0:1] if hasattr(model,"q_encoder") else None
+                y = model.encoder(x_padded, ctx if ctx is not None else feat_adapt, q_enc)
             except Exception:
                 y = None
 
-        # decoder + recon_generation_net -> reconstruction
-        x_hat = x
+        # decoder + recon net
+        x_hat_padded = x_padded
         if y is not None and hasattr(model, "decoder") and hasattr(model, "recon_generation_net"):
             try:
-                q_dec = model.q_decoder[0:1] if hasattr(model, "q_decoder") else None
-                q_recon = model.q_recon[0:1] if hasattr(model, "q_recon") else None
+                q_dec = model.q_decoder[0:1] if hasattr(model,"q_decoder") else None
+                q_recon = model.q_recon[0:1] if hasattr(model,"q_recon") else None
                 feat_dec = model.decoder(y, ctx if ctx is not None else feat_adapt, q_dec)
-                x_hat = model.recon_generation_net(feat_dec, q_recon).clamp(0,1)
-                # update DPB with feature and recon (so next frame can use it)
+                x_hat_padded = model.recon_generation_net(feat_dec, q_recon).clamp(0,1)
+                # update dpb for next frame
                 try:
-                    model.add_ref_frame(feature=feat_dec, frame=x_hat, increase_poc=True)
+                    model.add_ref_frame(feature=feat_dec, frame=x_hat_padded, increase_poc=True)
                 except Exception:
                     try:
-                        model.add_ref_frame(frame=x_hat, increase_poc=True)
+                        model.add_ref_frame(frame=x_hat_padded, increase_poc=True)
                     except Exception:
-                        # best-effort: maintain dpb manually
                         pass
-            except Exception:
-                # fallback to identity if decoder failed
-                x_hat = x
+            except Exception as e:
+                # fallback identity if decoder fails
+                # print("decoder failed:", e)
+                x_hat_padded = x_padded
 
-    # compute MSE and PSNR
+    # crop back to original H,W
+    x_hat = x_hat_padded[..., :H, :W]  # crop bottom/right if padded
+
     mse = F.mse_loss(x_hat, x, reduction="mean").item()
     psnr = mse_to_psnr(mse)
     mse_list.append(mse)
     psnr_list.append(psnr)
 
-    # save reconstructed frame to out_dir
+    # save reconstructed frame (clipped)
     out_np = (x_hat[0].cpu().numpy().transpose(1,2,0) * 255.0).round().astype(np.uint8)
-    out_pil = Image.fromarray(out_np)
-    out_name = os.path.join(out_dir, f"frame_{i:05d}.png")
-    out_pil.save(out_name)
+    Image.fromarray(out_np).save(os.path.join(out_dir, f"frame_{i:05d}.png"))
 
-    if i < 3:  # print first few frames stats
-        print(f"frame {i}: mse={mse:.6e} psnr={psnr if psnr != float('inf') else 'inf'} dB saved -> {out_name}")
+    if i < 3:
+        print(f"frame {i}: mse={mse:.6e} psnr={psnr if psnr!=float('inf') else 'inf'} saved -> {os.path.join(out_dir, f'frame_{i:05d}.png')}")
 
-# Summary
+# summary
+finite_psnrs = [p for p in psnr_list if np.isfinite(p)]
 avg_mse = float(np.mean(mse_list))
-avg_psnr = float(np.mean([p for p in psnr_list if np.isfinite(p)])) if len(psnr_list)>0 else float('nan')
-print("Reconstruction complete.")
-print(f"Frames processed: {len(frame_paths)}  Average MSE: {avg_mse:.6e}  Average PSNR (finite only): {avg_psnr:.3f} dB")
-
+avg_psnr = float(np.mean(finite_psnrs)) if len(finite_psnrs)>0 else float('nan')
+print("Done. frames:", len(frame_paths), "avg_mse:", avg_mse, "avg_psnr (finite only):", avg_psnr)
 print("Saved reconstructed frames to:", out_dir)
-print("To assemble into video (if you have ffmpeg installed):")
-print(f"  ffmpeg -y -framerate 30 -i {out_dir}/frame_%05d.png -c:v libx264 -pix_fmt yuv420p {out_dir}/recon_clip_01.mp4")
-print("If ffmpeg not available, you can view the PNGs or use OpenCV to write an .avi/.mp4 if codec installed.")
