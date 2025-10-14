@@ -1,4 +1,4 @@
-# padded_reconstruct_clip.py with live PSNR plot (minimal changes)
+# padded_reconstruct_clip_with_live_plot_and_logs.py
 import os, math, glob, tqdm
 import numpy as np
 from PIL import Image
@@ -6,12 +6,12 @@ import torch
 import torch.nn.functional as F
 from src.models.video_model import DMC as VideoModel
 
-# --- Live plotting imports (added only) ---
-from IPython.display import display, clear_output
+# --- Display / plotting imports (changed to use update_display) ---
+from IPython.display import display, update_display
 import matplotlib
 matplotlib.use('module://matplotlib_inline.backend_inline')
 import matplotlib.pyplot as plt
-# ------------------------------------------------
+# --------------------------------------------------------------------
 
 # Paths - edit if needed
 ckpt_path = "./checkpoints_finetune_lambda0.01/best_epoch010.pth.tar"
@@ -65,7 +65,7 @@ psnr_list = []
 mse_list = []
 
 # -------------------------
-# Initialize live PSNR plot
+# Initialize live PSNR plot (use display + update_display so prints/tqdm remain)
 # -------------------------
 fig, ax = plt.subplots(figsize=(10,3))
 ax.set_title("PSNR per frame (live)")
@@ -75,9 +75,14 @@ ax.grid(True)
 line, = ax.plot([], [], marker='o', markersize=2)
 ax.set_xlim(0, max(10, len(frame_paths)))
 ax.set_ylim(0, 50)
-display(fig)
+
+# Display the figure once and capture its display id so we can update it in place.
+display(fig)                 # shows the initial figure
+# Note: update_display uses the same object reference to replace the output in-place
+# We'll call update_display(fig) below every iteration.
 # -------------------------
 
+# Main loop (unchanged logic except we update the plot in-place)
 for i, p in enumerate(tqdm.tqdm(frame_paths, desc="Frames")):
     im = Image.open(p).convert("RGB")
     arr = np.asarray(im, dtype=np.float32)/255.0
@@ -182,23 +187,23 @@ for i, p in enumerate(tqdm.tqdm(frame_paths, desc="Frames")):
     out_np = (x_hat[0].cpu().numpy().transpose(1,2,0) * 255.0).round().astype(np.uint8)
     Image.fromarray(out_np).save(os.path.join(out_dir, f"frame_{i:05d}.png"))
 
-    if i < 3:
-        print(f"frame {i}: mse={mse:.6e} psnr={psnr if psnr!=float('inf') else 'inf'} saved -> {os.path.join(out_dir, f'frame_{i:05d}.png')}")
+    # Print per-frame log (same style you used before)
+    print(f"frame {i}: mse={mse:.6e} psnr={psnr if psnr!=float('inf') else 'inf'} saved -> {os.path.join(out_dir, f'frame_{i:05d}.png')}")
 
     # -------------------------
-    # Update live PSNR plot (added only)
+    # Update live PSNR plot in-place (so tqdm and past prints remain visible)
     # -------------------------
     try:
         line.set_xdata(np.arange(len(psnr_list)))
         line.set_ydata(np.array(psnr_list))
         ax.relim()
         ax.autoscale_view()
-        clear_output(wait=True)
-        display(fig)
+        # update_display will replace the existing figure output in-place (no clearing of text)
+        update_display(fig)   # in-place update of the previously displayed figure
         plt.pause(0.001)
-    except Exception:
+    except Exception as e:
         # non-fatal: continue without plotting if update fails
-        pass
+        print("Plot update failed:", e)
     # -------------------------
 
 # summary
