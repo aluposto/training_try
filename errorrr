@@ -1,11 +1,5 @@
-device: cuda
-Loaded checkpoint: ./checkpoints_finetune_lambda0.01/best_epoch000.pth.tar
-Frames:   0% 1/610 [00:01<16:02,  1.58s/it]
-frame 0: mse=3.457697e-03 psnr=24.612131117471744 saved -> outputs/recon_frames/clip_01_padded/frame_00000.png
-Frames:   0% 2/610 [00:02<14:09,  1.40s/it]
-frame 1: mse=2.586744e-03 psnr=25.872465059345238 saved -> outputs/recon_frames/clip_01_padded/frame_00001.png
-Frames:   0% 3/610 [00:04<13:21,  1.32s/it]
-frame 2: mse=2.571561e-03 psnr=25.898031455186565 saved -> outputs/recon_frames/clip_01_padded/frame_00002.png
-Frames: 100% 610/610 [13:59<00:00,  1.38s/it]
-Done. frames: 610 avg_mse: 0.01811270120526954 avg_psnr (finite only): 22.774345426224436
+Frames:  98% 596/610 [12:59<00:10,  1.28it/s]/tmp/ipykernel_431/3782668488.py:161: RuntimeWarning: invalid value encountered in cast
+  out_np = (x_hat[0].cpu().numpy().transpose(1,2,0) * 255.0).round().astype(np.uint8)
+Frames: 100% 610/610 [13:08<00:00,  1.29s/it]
+Done. frames: 610 avg_mse: nan avg_psnr (finite only): 25.340956801606666
 Saved reconstructed frames to: outputs/recon_frames/clip_01_padded
