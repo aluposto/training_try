@@ -1,22 +1,253 @@
-device: cuda
-cannot import cuda implementation for inference, fallback to pytorch.
-Loaded checkpoint: ./checkpoints_finetune_lambda0.01/best_epoch000.pth.tar
-model.update() failed or not needed (continuing with fallback).
-Frames:   0% 1/610 [00:07<1:18:42,  7.76s/it]
-frame 0: mse=0.000000e+00 psnr=inf dB saved -> outputs/recon_frames/clip_01/frame_00000.png
-Frames:   0% 2/610 [00:08<34:53,  3.44s/it]  
-frame 1: mse=0.000000e+00 psnr=inf dB saved -> outputs/recon_frames/clip_01/frame_00001.png
-Frames:   0% 3/610 [00:08<20:54,  2.07s/it]
-frame 2: mse=0.000000e+00 psnr=inf dB saved -> outputs/recon_frames/clip_01/frame_00002.png
-Frames: 100% 610/610 [05:45<00:00,  1.77it/s]
-Reconstruction complete.
-Frames processed: 610  Average MSE: 0.000000e+00  Average PSNR (finite only): nan dB
-Saved reconstructed frames to: outputs/recon_frames/clip_01
-To assemble into video (if you have ffmpeg installed):
-  ffmpeg -y -framerate 30 -i outputs/recon_frames/clip_01/frame_%05d.png -c:v libx264 -pix_fmt yuv420p outputs/recon_frames/clip_01/recon_clip_01.mp4
-If ffmpeg not available, you can view the PNGs or use OpenCV to write an .avi/.mp4 if codec installed.
+Nice — "Done. Found 0 bad frames." is actually useful information. It tells us that when you run the single-frame encode→decode check we used, none of the individual frames produce NaNs. So the avg_mse: nan you sometimes see must be coming from one of these other causes:
 
-/home/work/dcvc/miniconda3/envs/dcvc_env/lib/python3.12/site-packages/numpy/_core/fromnumeric.py:3904: RuntimeWarning: Mean of empty slice.
-  return _methods._mean(a, axis=axis, dtype=dtype,
-/home/work/dcvc/miniconda3/envs/dcvc_env/lib/python3.12/site-packages/numpy/_core/_methods.py:147: RuntimeWarning: invalid value encountered in scalar divide
-  ret = ret.dtype.type(ret / rcount)
+a NaN produced only when processing multiple frames in sequence (DPB / reference-frame logic interacting across time), or
+
+NaNs appearing only during the full reconstruction loop (e.g. when padding is applied, or when compress/decompress is called repeatedly), or
+
+NaNs appearing during aggregation (e.g. np.mean over an empty array or all-NaN array), or
+
+intermittent floating point / race condition that never hits for the single-frame test.
+
+
+Let’s methodically resolve this. I’ll give short checks you can run now (copy/paste), explain what each does, and then give the fixes (sanitize outputs, training recommendations). Do them in order until the NaN disappears.
+
+
+---
+
+1) Quick verify: are any saved reconstructed PNGs NaN/invalid?
+
+If earlier inference saved PNG files, check whether any saved file contains non-finite pixels (this will catch issues in the save pipeline).
+
+Run this (works even if you already sanitized — it checks the saved PNGs):
+
+# check_saved_recons.py
+import numpy as np, glob, os
+from PIL import Image
+
+saved_glob = "outputs/recon_frames/clip_01_padded/*.png"   # adjust path you used
+files = sorted(glob.glob(saved_glob))
+bad_saved = []
+for p in files:
+    im = np.asarray(Image.open(p).convert("RGB"), dtype=np.float32)/255.0
+    if not np.isfinite(im).all():
+        bad_saved.append((p, np.nanmin(im), np.nanmax(im)))
+print("Checked", len(files), "saved images. Bad saved images:", len(bad_saved))
+for b in bad_saved[:10]:
+    print(b)
+
+If this prints any bad saved images, they are source of invalid value encountered in cast. If 0, proceed.
+
+
+---
+
+2) Check reconstruction outputs produced during encode/decode sequence (per-frame) — sequence-mode
+
+Earlier we tested each frame individually via encode_decode_sequence(model, x.unsqueeze(1)). Now test the same wrapper on the entire clip (T=full video) and detect the first frame with non-finite pixels. This catches DPB / sequential behavior.
+
+# check_sequence_nan.py
+import glob, numpy as np, torch, os
+from PIL import Image
+from src.models.video_model import DMC as VideoModel
+from training import encode_decode_sequence
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = VideoModel().to(device).eval()
+ckpt = "./checkpoints_finetune_lambda0.01/best_epoch001.pth.tar"
+ck = torch.load(ckpt, map_location='cpu')
+sd = ck.get('state_dict', ck)
+model.load_state_dict({k.replace('module.',''):v for k,v in sd.items()}, strict=False)
+print("Loaded", ckpt)
+
+# load entire clip frames into a single seq [1,T,3,H,W]
+frame_paths = sorted(glob.glob("data/frames/val/clip_01/*.png"))
+imgs = []
+for p in frame_paths:
+    im = np.asarray(Image.open(p).convert("RGB"), dtype=np.float32)/255.0
+    imgs.append(im.transpose(2,0,1))
+seq = np.stack(imgs, axis=0)   # [T, C, H, W]
+seq = torch.from_numpy(seq).unsqueeze(0).to(device)  # [1,T,C,H,W]
+
+out = encode_decode_sequence(model, seq, qp=0)
+x_hat_seq = out['x_hat']   # [1,T,C,H,W]
+xhat_np = x_hat_seq[0].cpu().numpy()   # [T,C,H,W]
+bad_frames = []
+for t in range(xhat_np.shape[0]):
+    a = xhat_np[t]
+    if not np.isfinite(a).all():
+        bad_frames.append((t, float(np.nanmin(a)), float(np.nanmax(a))))
+print("bad frames in sequence run:", bad_frames)
+
+If this reports bad frames, we now know the problem is sequential and triggered only in the multi-frame pipeline (DPB / compress-decompress interactions). Paste the bad_frames output here and I will give targeted next steps (hooks into temporal modules).
+
+If this reports [] (no bad frames), proceed.
+
+
+---
+
+3) Check model parameters for NaN/Inf
+
+Run this — if parameters contain NaN the model is corrupted:
+
+# check_params_nan.py
+import torch
+from src.models.video_model import DMC as VideoModel
+m = VideoModel().cuda().eval()
+ck = torch.load("./checkpoints_finetune_lambda0.01/best_epoch001.pth.tar", map_location='cpu')
+sd = ck.get('state_dict', ck)
+m.load_state_dict({k.replace('module.',''):v for k,v in sd.items()}, strict=False)
+nan_any = False
+for name, p in m.named_parameters():
+    if not torch.isfinite(p).all():
+        print("PARAM NaN/Inf:", name, p.dtype, p.shape)
+        nan_any = True
+print("Any param NaN/Inf:", nan_any)
+
+If any param is NaN/Inf — we must revert to a previous checkpoint and avoid resuming from the corrupted one. Use an earlier saved checkpoint. If none, proceed.
+
+
+---
+
+4) Add per-step forward hooks that detect first NaN during sequence run
+
+If step 2 showed bad frames, run a more detailed hook which prints the module where NaN first appears while running the sequence (so we capture temporal interactions). Replace bad_t with the first bad frame index from step 2 if you have it; otherwise it will run and stop on the first occurrence.
+
+# hook_on_sequence.py
+import torch, numpy as np, glob
+from PIL import Image
+from src.models.video_model import DMC as VideoModel
+from training import encode_decode_sequence
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = VideoModel().to(device).eval()
+ck = torch.load("./checkpoints_finetune_lambda0.01/best_epoch001.pth.tar", map_location='cpu')
+sd = ck.get('state_dict', ck); model.load_state_dict({k.replace('module.',''):v for k,v in sd.items()}, strict=False)
+print("Loaded checkpoint")
+
+# load frames
+frame_paths = sorted(glob.glob("data/frames/val/clip_01/*.png"))
+imgs = [np.asarray(Image.open(p).convert("RGB"), dtype=np.float32)/255.0 for p in frame_paths]
+seq = torch.stack([torch.from_numpy(im.transpose(2,0,1)) for im in imgs], dim=0).unsqueeze(0).to(device)  # [1,T,C,H,W]
+
+# helper to register hooks
+found = {'flag': False}
+def make_hook(name):
+    def hook(module, inp, out):
+        if found['flag']:
+            return
+        try:
+            if isinstance(out, torch.Tensor):
+                if not torch.isfinite(out).all():
+                    print("NaN found in module:", name, "class:", module.__class__.__name__)
+                    print("out min/max:", float(torch.nanmin(out)), float(torch.nanmax(out)))
+                    found['flag'] = True
+            else:
+                # if out is tuple/list inspect tensors inside
+                if isinstance(out, (list,tuple)):
+                    for o in out:
+                        if isinstance(o, torch.Tensor) and not torch.isfinite(o).all():
+                            print("NaN found in module (tuple):", name, module.__class__.__name__)
+                            found['flag'] = True
+                            return
+        except Exception as e:
+            print("hook error", e)
+    return hook
+
+handles = []
+for i,m in enumerate(model.modules()):
+    handles.append(m.register_forward_hook(make_hook(f"idx{i}_{m.__class__.__name__}")))
+
+# run encode-decode sequence (it will trigger hooks)
+try:
+    out = encode_decode_sequence(model, seq, qp=0)
+finally:
+    for h in handles: h.remove()
+
+if not found['flag']:
+    print("No NaNs detected by hooks during sequence run.")
+
+If hooks report a module name (e.g. a layer in cuda_inference or DepthConvBlock etc.), paste that output. I will then give exact code edits (e.g., clamp, add eps, adjust padding) for that module.
+
+
+---
+
+5) Sanitize outputs and compute robust PSNR (short-term)
+
+While you debug, avoid crashing and get consistent metrics — sanitize recon before saving / averaging.
+
+Replace your save/metric code with:
+
+# sanitize x_hat numpy before saving or computing MSE
+x_hat_np = x_hat[0].cpu().numpy().transpose(1,2,0)   # H,W,3
+x_hat_np = np.nan_to_num(x_hat_np, nan=0.0, posinf=1.0, neginf=0.0)
+x_hat_np = np.clip(x_hat_np, 0.0, 1.0)
+# compute mse
+orig_np = orig_img_np  # your original frame normalized 0-1
+mse = np.mean((orig_np - x_hat_np)**2)
+psnr = 10*np.log10(1.0/mse) if mse>0 and np.isfinite(mse) else float('nan')
+
+This will stop the astype(np.uint8) warning and let you compute avg_psnr across finite frames. But this is only a bandaid.
+
+
+---
+
+6) Training recommendations (if problem is training-related)
+
+You already tried retraining 30/100 epochs and still saw NaNs intermittently. Common robust actions:
+
+1. Disable AMP — run in FP32 for stability: remove --amp.
+
+
+2. Lower LR substantially (e.g. --lr 5e-5 or 1e-5).
+
+
+3. Stronger grad clipping: --max-norm 0.5.
+
+
+4. Save each epoch and monitor per-epoch validation reconstructions and parameter stats.
+
+
+5. Use guard in training.py to abort & restore on non-finite loss / grads (I gave snippet earlier).
+
+
+6. If NaN occurs only in sequence mode but not single-frame, check temporal modules (prior encoder/decoder, DPB add_ref_frame) rather than global optimizer settings.
+
+
+
+
+---
+
+Why you sometimes see avg_mse: nan while find_bad_frames found 0
+
+Likely causes (so you know what to look for):
+
+NaNs appear only when frames are processed sequentially — DPB or reference features depend on previous frames; the single-frame run doesn't exercise that state.
+
+NaN produced only briefly during decompress/compress step inside encode_decode_sequence but the single-frame encode/decode path avoided that code path.
+
+Aggregation bug: e.g. computing np.mean over an empty list or list of only NaNs results in nan average. We saw warnings Mean of empty slice in your logs previously, which indicates some intermediate list was empty when computing an aggregate.
+
+Intermittent race / non-determinism — first run OK, later run has different device state.
+
+
+
+---
+
+Next step I recommend you run now
+
+1. Run step 2 (sequence check) I gave above. If it prints bad frames, run step 4 (hook_on_sequence) for the first bad frame and paste the hook output here. That will let me pinpoint the module and give concrete code edits (very likely we’ll add a clamp or small eps in the failing module or fix DPB initialization/padding).
+
+
+2. If sequence check returns no bad frames, run step 1 to ensure saved PNGs are finite. If both are clear but you still saw avg_mse: nan previously, paste the exact output of the run that produced nan (the few lines above the final summary) — especially any warnings Mean of empty slice or other exceptions.
+
+
+
+
+---
+
+If you want, I can also:
+
+Produce a patch to training.py that (A) sanitizes outputs before saving, (B) logs the per-frame finite check and stops the job if NaNs appear, and (C) prints the first frame index and module where NaN appeared. I can create that patch and show the diff for you to apply.
+
+
+Which do you want to do next — run the sequence check now and paste the result, or have me write the protective patch for training.py?
+
