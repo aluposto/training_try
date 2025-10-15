@@ -1,4 +1,4 @@
-# padded_reconstruct_clip_unique_plot_with_stability.py
+# padded_reconstruct_clip_unique_plot_intra_fallback.py
 import os, math, glob, tqdm, time, uuid
 import numpy as np
 from PIL import Image
@@ -17,19 +17,22 @@ import matplotlib.pyplot as plt
 # ----------------------
 ckpt_path = "./checkpoints_new_lambda0.01/best_epoch002.pth.tar"
 frames_dir = "data/frames/train/clip_01"
-out_dir = "outputs/recon_frames/new_train/1_clip_01_padded"
+out_dir = "outputs/recon_frames/new_train/1_clip_01_padded_intra_fallback"
 os.makedirs(out_dir, exist_ok=True)
 
-# Optional: provide a human run name to help identify this plot (can be '')
+# Optional: human run name to identify the plot (can be '')
 run_name = ""  # e.g. "run_lr1e-4" or leave empty
 
-# Periodic DPB (I-frame) refresh frequency: every N frames (choose 0 to disable)
-REFRESH_N = 50  # e.g., 50; change to 30 if you prefer a reset every 30 frames
+# DPB refresh frequency (0 disables periodic refresh)
+REFRESH_N = 30  # your previous value; adjust if desired
 
-# Stability / bad-frame detection parameters
+# Bad-frame detection and fallback parameters
 MSE_HISTORY_LEN = 16
-BAD_MSE_FACTOR = 10.0       # if current_mse > BAD_MSE_FACTOR * median(mse_history) => bad
-BAD_MSE_MIN = 1e-7          # if median below this, don't use relative test (prevents divide-by-zero)
+BAD_MSE_FACTOR = 8.0          # relative threshold (current_mse > BAD_MSE_FACTOR * median(history))
+BAD_MSE_MIN = 1e-8            # avoid divide-by-zero for very small medians
+CONSECUTIVE_BAD_LIMIT = 5    # if this many bad frames in a row occur, enable intra-only fallback
+INTRA_MODE_FRAMES = 10       # number of frames to process in intra-only mode after triggering
+MAX_ALLOWED_NONFINITE = 0     # if any nonfinite pixel found in reconstruction treat as bad
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("device:", device)
@@ -46,20 +49,9 @@ else:
 
 # Helper: PSNR
 def mse_to_psnr(mse, max_val=1.0):
-    if mse <= 0:
-        return float("inf")
+    if not np.isfinite(mse) or mse <= 0:
+        return float("inf") if mse == 0 else float("nan")
     return 10.0 * math.log10((max_val**2) / mse)
-
-# helper to compute padding so H and W become multiples of 16
-def get_pad_amount(height, width, mult=16):
-    pad_h = (mult - (height % mult)) % mult
-    pad_w = (mult - (width % mult)) % mult
-    # pad format for torch.nn.functional.pad: (left, right, top, bottom)
-    left = 0
-    right = pad_w
-    top = 0
-    bottom = pad_h
-    return (left, right, top, bottom)
 
 # get frame list
 frame_paths = sorted(glob.glob(os.path.join(frames_dir, "*.png")))
@@ -75,9 +67,12 @@ except Exception:
 psnr_list = []
 mse_list = []
 
-# --- stability state
-last_good_frame = None             # padded [1,C,Hp,Wp] torch tensor
+# stability tracking
 mse_history = []
+last_good_frame = None
+consecutive_bad = 0
+intra_mode_counter = 0
+intra_mode_active = False
 
 # --------------------------
 # Create a unique display id
@@ -87,10 +82,9 @@ unique_token = uuid.uuid4().hex[:8]
 _display_id_str = f"psnr_plot_{timestamp_ms}_{unique_token}"
 if run_name:
     _display_id_str = f"{_display_id_str}_{run_name}"
-
 print("Live PSNR plot display_id:", _display_id_str)
 
-# Prepare the matplotlib figure (we will display it and then update with update_display)
+# Prepare matplotlib figure
 fig, ax = plt.subplots(figsize=(10, 3))
 ax.set_title("PSNR per frame (live) — " + (_display_id_str if run_name == "" else run_name))
 ax.set_xlabel("frame index")
@@ -100,12 +94,11 @@ line, = ax.plot([], [], marker='o', markersize=3, linestyle='-', linewidth=0.7)
 ax.set_xlim(0, max(10, len(frame_paths)))
 ax.set_ylim(0, 50)
 
-# display once (this creates a persistent output cell for this run)
+# display once (creates persistent output cell)
 try:
     display(fig, display_id=_display_id_str)
-    plt.close(fig)  # avoid duplicate static figure below the live output
+    plt.close(fig)
 except Exception:
-    # If display/update not available (running as a script outside notebook), ignore
     pass
 
 # --------------------------
@@ -142,7 +135,14 @@ for i, p in enumerate(tqdm.tqdm(frame_paths, desc="Frames")):
                 model.dpb = []
                 model.add_ref_frame(frame=zeros, increase_poc=False)
 
-    # run best-effort differentiable encode-decode path (no entropy coder)
+    # Decide whether to operate in intra-only mode
+    if intra_mode_active:
+        # intra-only: clear DPB (no temporal references) and reconstruct frame independently
+        try:
+            model.clear_dpb()
+        except Exception:
+            model.dpb = []
+    # Run best-effort differentiable encoder/decoder path (no entropy coder used here)
     with torch.no_grad():
         try:
             feat_adapt = model.apply_feature_adaptor()
@@ -183,99 +183,110 @@ for i, p in enumerate(tqdm.tqdm(frame_paths, desc="Frames")):
             except Exception:
                 x_hat_padded = x_padded
 
-    # --------------------------
-    # SANITIZE / BAD-FRAME DETECTION
-    # --------------------------
+    # SANITIZE non-finite or extreme values
     try:
-        # If we observe non-finite values, replace with last_good_frame or clamp
-        if not torch.isfinite(x_hat_padded).all():
+        if not torch.isfinite(x_hat_padded).all() or (torch.isfinite(x_hat_padded).sum().item() <= MAX_ALLOWED_NONFINITE):
+            # very bad: replace with last_good_frame or clamp
             if last_good_frame is not None:
                 x_hat_padded = last_good_frame.clone()
             else:
                 x_hat_padded = torch.clamp(torch.nan_to_num(x_hat_padded, nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0)
-
-        # clamp extreme values
         x_hat_padded = torch.clamp(x_hat_padded, 0.0, 1.0)
     except Exception:
-        # in case of any unexpected error, fallback to input padded
         x_hat_padded = torch.clamp(x_padded, 0.0, 1.0)
 
-    # crop back to original H,W for measuring
+    # crop back to original H,W
     x_hat = x_hat_padded[..., :H, :W]
 
     # compute mse/psnr
-    mse = F.mse_loss(x_hat, x, reduction="mean").item()
+    mse = float(F.mse_loss(x_hat, x, reduction="mean").item())
     psnr = mse_to_psnr(mse)
 
-    # update history and check outlier
+    # Update history
     mse_history.append(mse)
     if len(mse_history) > MSE_HISTORY_LEN:
         mse_history.pop(0)
 
+    # Bad-frame detection (relative to history)
     is_bad = False
-    try:
-        if not np.isfinite(mse):
-            is_bad = True
-        elif len(mse_history) >= 3:
+    if not np.isfinite(mse):
+        is_bad = True
+    else:
+        if len(mse_history) >= 3:
             med = float(np.median(mse_history))
             if med > BAD_MSE_MIN and mse > BAD_MSE_FACTOR * med:
                 is_bad = True
-    except Exception:
-        is_bad = False
 
-    # If bad: try to replace with last_good_frame (if exists), and do not add bad frame to DPB
+    # If bad -> replace with last_good_frame (if possible). Do NOT add bad frame to DPB.
     if is_bad:
+        consecutive_bad += 1
         if last_good_frame is not None:
             x_hat_padded = last_good_frame.clone()
             x_hat = x_hat_padded[..., :H, :W]
-            mse = F.mse_loss(x_hat, x, reduction="mean").item()
+            mse = float(F.mse_loss(x_hat, x, reduction="mean").item())
             psnr = mse_to_psnr(mse)
-            print(f"Warning: bad frame {i} detected (mse large or non-finite). Replaced with last_good_frame.")
         else:
-            # fallback to input if no last_good_frame yet
+            # fallback identity
             x_hat_padded = torch.clamp(x_padded, 0.0, 1.0)
             x_hat = x_hat_padded[..., :H, :W]
-            mse = F.mse_loss(x_hat, x, reduction="mean").item()
+            mse = float(F.mse_loss(x_hat, x, reduction="mean").item())
             psnr = mse_to_psnr(mse)
-
-    # If frame is good: update last_good_frame and add to DPB normally
-    if not is_bad:
+        print(f"Warning: bad frame {i} detected (mse large or non-finite). Replaced with last_good_frame or input.")
+    else:
+        consecutive_bad = 0
+        # good frame -> update last_good_frame and add to DPB unless we are in intra-mode
         try:
             last_good_frame = x_hat_padded.clone().detach()
         except Exception:
             last_good_frame = None
 
-        # Add to DPB using available signatures; best-effort
-        try:
-            if feat_dec is not None:
-                model.add_ref_frame(feature=feat_dec, frame=x_hat_padded, increase_poc=True)
-            else:
-                model.add_ref_frame(frame=x_hat_padded, increase_poc=True)
-        except Exception:
+        if not intra_mode_active:
             try:
-                model.add_ref_frame(frame=x_hat_padded, increase_poc=True)
+                if feat_dec is not None:
+                    model.add_ref_frame(feature=feat_dec, frame=x_hat_padded, increase_poc=True)
+                else:
+                    model.add_ref_frame(frame=x_hat_padded, increase_poc=True)
             except Exception:
-                pass
-    else:
-        # Do not add the bad reconstruction to dpb. Optionally re-insert last_good_frame as non-increasing reference (keeps dpb stable)
-        try:
-            if last_good_frame is not None:
-                # add as reference but do NOT increase poc (so it doesn't act as a new poisoned reference)
-                model.add_ref_frame(frame=last_good_frame, increase_poc=False)
-        except Exception:
+                try:
+                    model.add_ref_frame(frame=x_hat_padded, increase_poc=True)
+                except Exception:
+                    pass
+        else:
+            # intra mode: we DON'T add to DPB (keeps DPB empty)
             pass
 
-    # --------------------------
-    # Periodic DPB refresh (simulate stable I-frame using last_good_frame)
-    # --------------------------
+    # If many consecutive bad frames, enter intra-only fallback mode for a while
+    if consecutive_bad >= CONSECUTIVE_BAD_LIMIT and not intra_mode_active:
+        intra_mode_active = True
+        intra_mode_counter = INTRA_MODE_FRAMES
+        print(f"*** Entering INTRA-ONLY fallback for {INTRA_MODE_FRAMES} frames (triggered at frame {i}). ***")
+        # clear DPB now to avoid using poisoned refs
+        try:
+            model.clear_dpb()
+        except Exception:
+            model.dpb = []
+
+    # If in intra-mode count down and exit when done
+    if intra_mode_active:
+        intra_mode_counter -= 1
+        if intra_mode_counter <= 0:
+            intra_mode_active = False
+            consecutive_bad = 0
+            # Re-init DPB with last_good_frame if available
+            try:
+                if last_good_frame is not None:
+                    model.clear_dpb()
+                    model.add_ref_frame(frame=last_good_frame, increase_poc=False)
+                else:
+                    model.clear_dpb()
+            except Exception:
+                pass
+            print(f"*** Exited INTRA-ONLY fallback at frame {i}. Resuming normal mode. ***")
+
+    # Periodic DPB refresh (simulate an I-frame) using last_good_frame when possible
     if REFRESH_N > 0 and (i + 1) % REFRESH_N == 0:
         try:
-            # prefer last_good_frame for refresh; fallback to zeros
-            if last_good_frame is not None:
-                ref_for_refresh = last_good_frame.clone().detach()
-            else:
-                ref_for_refresh = torch.zeros_like(x_padded)
-            # clear DPB and add the reference (do NOT increase poc to keep continuity)
+            ref_for_refresh = last_good_frame.clone().detach() if last_good_frame is not None else torch.zeros_like(x_padded)
             try:
                 model.clear_dpb()
             except Exception:
@@ -286,35 +297,32 @@ for i, p in enumerate(tqdm.tqdm(frame_paths, desc="Frames")):
                 try:
                     model.add_ref_frame(feature=None, frame=ref_for_refresh, increase_poc=False)
                 except Exception:
-                    # last resort: set dpb directly
                     model.dpb = []
                     model.add_ref_frame(frame=ref_for_refresh, increase_poc=False)
             print(f"--- DPB refresh at frame {i+1} using {'last_good_frame' if last_good_frame is not None else 'zeros'} ---")
         except Exception as e:
             print(f"DPB refresh failed at frame {i+1}: {e}")
 
-    # save reconstructed frame while guarding against invalid values
+    # Save reconstructed frame (guard against invalid values)
     out_np = (np.clip(x_hat[0].cpu().numpy().transpose(1,2,0), 0.0, 1.0) * 255.0).round().astype(np.uint8)
     Image.fromarray(out_np).save(os.path.join(out_dir, f"frame_{i:05d}.png"))
 
+    # Minimal prints for first few frames
     if i < 3:
-        print(f"frame {i}: mse={mse:.6e} psnr={psnr if psnr!=float('inf') else 'inf'} saved -> {os.path.join(out_dir, f'frame_{i:05d}.png')}")
+        print(f"frame {i}: mse={mse:.6e} psnr={psnr if np.isfinite(psnr) else 'inf'} saved -> {os.path.join(out_dir, f'frame_{i:05d}.png')}")
 
-    # --------------------------
-    # Update the live PSNR plot in-place using the unique display id
-    # --------------------------
+    # Update live PSNR plot
     try:
-        line.set_xdata(np.arange(len(psnr_list) + 1))  # +1 since we haven't appended yet
+        line.set_xdata(np.arange(len(psnr_list) + 1))
         line.set_ydata(np.array(psnr_list + [psnr]))
         ax.relim()
         ax.autoscale_view()
         update_display(fig, display_id=_display_id_str)
         plt.pause(0.001)
     except Exception:
-        # silently ignore plotting errors (so logs remain clean)
         pass
 
-    # Append lists after plotting so the line shows current frame too
+    # Append histories
     mse_list.append(mse)
     psnr_list.append(psnr)
 
