@@ -1,4 +1,4 @@
-# padded_reconstruct_clip_unique_plot_option1.py
+# padded_reconstruct_clip_unique_plot_with_stability.py
 import os, math, glob, tqdm, time, uuid
 import numpy as np
 from PIL import Image
@@ -20,11 +20,16 @@ frames_dir = "data/frames/train/clip_01"
 out_dir = "outputs/recon_frames/new_train/1_clip_01_padded"
 os.makedirs(out_dir, exist_ok=True)
 
-# How often to force a DPB "I-frame" refresh (Option 1: use current reconstruction as ref)
-I_FRAME_INTERVAL = 50  # change as you like (50 was suggested)
-
 # Optional: provide a human run name to help identify this plot (can be '')
 run_name = ""  # e.g. "run_lr1e-4" or leave empty
+
+# Periodic DPB (I-frame) refresh frequency: every N frames (choose 0 to disable)
+REFRESH_N = 50  # e.g., 50; change to 30 if you prefer a reset every 30 frames
+
+# Stability / bad-frame detection parameters
+MSE_HISTORY_LEN = 16
+BAD_MSE_FACTOR = 10.0       # if current_mse > BAD_MSE_FACTOR * median(mse_history) => bad
+BAD_MSE_MIN = 1e-7          # if median below this, don't use relative test (prevents divide-by-zero)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("device:", device)
@@ -70,10 +75,13 @@ except Exception:
 psnr_list = []
 mse_list = []
 
+# --- stability state
+last_good_frame = None             # padded [1,C,Hp,Wp] torch tensor
+mse_history = []
+
 # --------------------------
 # Create a unique display id
 # --------------------------
-# Use a timestamp + uuid + optional run_name so each execution shows a new figure in the notebook
 timestamp_ms = int(time.time() * 1000)
 unique_token = uuid.uuid4().hex[:8]
 _display_id_str = f"psnr_plot_{timestamp_ms}_{unique_token}"
@@ -165,76 +173,125 @@ for i, p in enumerate(tqdm.tqdm(frame_paths, desc="Frames")):
                 y = None
 
         x_hat_padded = x_padded
+        feat_dec = None
         if y is not None and hasattr(model, "decoder") and hasattr(model, "recon_generation_net"):
             try:
                 q_dec = model.q_decoder[0:1] if hasattr(model,"q_decoder") else None
                 q_recon = model.q_recon[0:1] if hasattr(model,"q_recon") else None
                 feat_dec = model.decoder(y, ctx if ctx is not None else feat_adapt, q_dec)
                 x_hat_padded = model.recon_generation_net(feat_dec, q_recon).clamp(0,1)
-                try:
-                    model.add_ref_frame(feature=feat_dec, frame=x_hat_padded, increase_poc=True)
-                except Exception:
-                    try:
-                        model.add_ref_frame(frame=x_hat_padded, increase_poc=True)
-                    except Exception:
-                        pass
             except Exception:
                 x_hat_padded = x_padded
 
     # --------------------------
-    # Option 1 DPB refresh (use current reconstruction as I-frame reference)
-    # Runs every I_FRAME_INTERVAL frames, uses the reconstruction (not zeros),
-    # and prepares feature adaptor if available to avoid sudden jumps.
+    # SANITIZE / BAD-FRAME DETECTION
     # --------------------------
-    if I_FRAME_INTERVAL is not None and I_FRAME_INTERVAL > 0 and ((i + 1) % I_FRAME_INTERVAL == 0):
+    try:
+        # If we observe non-finite values, replace with last_good_frame or clamp
+        if not torch.isfinite(x_hat_padded).all():
+            if last_good_frame is not None:
+                x_hat_padded = last_good_frame.clone()
+            else:
+                x_hat_padded = torch.clamp(torch.nan_to_num(x_hat_padded, nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0)
+
+        # clamp extreme values
+        x_hat_padded = torch.clamp(x_hat_padded, 0.0, 1.0)
+    except Exception:
+        # in case of any unexpected error, fallback to input padded
+        x_hat_padded = torch.clamp(x_padded, 0.0, 1.0)
+
+    # crop back to original H,W for measuring
+    x_hat = x_hat_padded[..., :H, :W]
+
+    # compute mse/psnr
+    mse = F.mse_loss(x_hat, x, reduction="mean").item()
+    psnr = mse_to_psnr(mse)
+
+    # update history and check outlier
+    mse_history.append(mse)
+    if len(mse_history) > MSE_HISTORY_LEN:
+        mse_history.pop(0)
+
+    is_bad = False
+    try:
+        if not np.isfinite(mse):
+            is_bad = True
+        elif len(mse_history) >= 3:
+            med = float(np.median(mse_history))
+            if med > BAD_MSE_MIN and mse > BAD_MSE_FACTOR * med:
+                is_bad = True
+    except Exception:
+        is_bad = False
+
+    # If bad: try to replace with last_good_frame (if exists), and do not add bad frame to DPB
+    if is_bad:
+        if last_good_frame is not None:
+            x_hat_padded = last_good_frame.clone()
+            x_hat = x_hat_padded[..., :H, :W]
+            mse = F.mse_loss(x_hat, x, reduction="mean").item()
+            psnr = mse_to_psnr(mse)
+            print(f"Warning: bad frame {i} detected (mse large or non-finite). Replaced with last_good_frame.")
+        else:
+            # fallback to input if no last_good_frame yet
+            x_hat_padded = torch.clamp(x_padded, 0.0, 1.0)
+            x_hat = x_hat_padded[..., :H, :W]
+            mse = F.mse_loss(x_hat, x, reduction="mean").item()
+            psnr = mse_to_psnr(mse)
+
+    # If frame is good: update last_good_frame and add to DPB normally
+    if not is_bad:
         try:
-            # clear dpb safely
+            last_good_frame = x_hat_padded.clone().detach()
+        except Exception:
+            last_good_frame = None
+
+        # Add to DPB using available signatures; best-effort
+        try:
+            if feat_dec is not None:
+                model.add_ref_frame(feature=feat_dec, frame=x_hat_padded, increase_poc=True)
+            else:
+                model.add_ref_frame(frame=x_hat_padded, increase_poc=True)
+        except Exception:
+            try:
+                model.add_ref_frame(frame=x_hat_padded, increase_poc=True)
+            except Exception:
+                pass
+    else:
+        # Do not add the bad reconstruction to dpb. Optionally re-insert last_good_frame as non-increasing reference (keeps dpb stable)
+        try:
+            if last_good_frame is not None:
+                # add as reference but do NOT increase poc (so it doesn't act as a new poisoned reference)
+                model.add_ref_frame(frame=last_good_frame, increase_poc=False)
+        except Exception:
+            pass
+
+    # --------------------------
+    # Periodic DPB refresh (simulate stable I-frame using last_good_frame)
+    # --------------------------
+    if REFRESH_N > 0 and (i + 1) % REFRESH_N == 0:
+        try:
+            # prefer last_good_frame for refresh; fallback to zeros
+            if last_good_frame is not None:
+                ref_for_refresh = last_good_frame.clone().detach()
+            else:
+                ref_for_refresh = torch.zeros_like(x_padded)
+            # clear DPB and add the reference (do NOT increase poc to keep continuity)
             try:
                 model.clear_dpb()
             except Exception:
                 model.dpb = []
-
-            # choose ref frame: prefer reconstruction, fallback to input
             try:
-                ref_frame = x_hat_padded.clone().detach()
-            except Exception:
-                ref_frame = x_padded.clone().detach()
-
-            # add the reference frame (try multiple signatures)
-            try:
-                model.add_ref_frame(frame=ref_frame, increase_poc=False)
+                model.add_ref_frame(frame=ref_for_refresh, increase_poc=False)
             except Exception:
                 try:
-                    model.add_ref_frame(feature=None, frame=ref_frame, increase_poc=False)
-                except Exception as e:
-                    print(f"DPB refresh failed at frame {i+1}: {e}")
-
-            # prepare feature adaptor for I-frame usage if model provides helper
-            if hasattr(model, "prepare_feature_adaptor_i"):
-                try:
-                    model.prepare_feature_adaptor_i(last_qp=0)
+                    model.add_ref_frame(feature=None, frame=ref_for_refresh, increase_poc=False)
                 except Exception:
-                    # ignore
-                    pass
-
-            # reset cached ref feature if available
-            if hasattr(model, "reset_ref_feature"):
-                try:
-                    model.reset_ref_feature()
-                except Exception:
-                    pass
-
-            print(f"--- DPB refresh at frame {i+1} using current reconstruction (simulated I-frame) ---")
+                    # last resort: set dpb directly
+                    model.dpb = []
+                    model.add_ref_frame(frame=ref_for_refresh, increase_poc=False)
+            print(f"--- DPB refresh at frame {i+1} using {'last_good_frame' if last_good_frame is not None else 'zeros'} ---")
         except Exception as e:
-            print(f"DPB refresh overall failed at frame {i+1}: {e}")
-
-    # crop back to original H,W
-    x_hat = x_hat_padded[..., :H, :W]
-
-    mse = F.mse_loss(x_hat, x, reduction="mean").item()
-    psnr = mse_to_psnr(mse)
-    mse_list.append(mse)
-    psnr_list.append(psnr)
+            print(f"DPB refresh failed at frame {i+1}: {e}")
 
     # save reconstructed frame while guarding against invalid values
     out_np = (np.clip(x_hat[0].cpu().numpy().transpose(1,2,0), 0.0, 1.0) * 255.0).round().astype(np.uint8)
@@ -247,8 +304,8 @@ for i, p in enumerate(tqdm.tqdm(frame_paths, desc="Frames")):
     # Update the live PSNR plot in-place using the unique display id
     # --------------------------
     try:
-        line.set_xdata(np.arange(len(psnr_list)))
-        line.set_ydata(np.array(psnr_list))
+        line.set_xdata(np.arange(len(psnr_list) + 1))  # +1 since we haven't appended yet
+        line.set_ydata(np.array(psnr_list + [psnr]))
         ax.relim()
         ax.autoscale_view()
         update_display(fig, display_id=_display_id_str)
@@ -256,6 +313,10 @@ for i, p in enumerate(tqdm.tqdm(frame_paths, desc="Frames")):
     except Exception:
         # silently ignore plotting errors (so logs remain clean)
         pass
+
+    # Append lists after plotting so the line shows current frame too
+    mse_list.append(mse)
+    psnr_list.append(psnr)
 
 # summary
 finite_psnrs = [p for p in psnr_list if np.isfinite(p)]
