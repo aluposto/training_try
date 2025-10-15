@@ -1,5 +1,62 @@
-I use this one works perfectly
-!ffmpeg -y -framerate 60 -i outputs/recon_frames/new_train/epo26_clip_01_padded/frame_%05d.png -c:v libx264 -pix_fmt yuv420p outputs/recon_frames/new_train/epo26_clip_01_padded/recon_clip_01_30ep_0026cp_30buffer.mp4
- but i am trying to use this one not working
-
-!ffmpeg.exe -i outputs/recon_frames/new_train/epo26_clip_01_padded/recon_clip_01_30ep_0026cp_30buffer.mp4 -i data/train_videos/clip_01.mp4 -filter_complex "psnr=1:ssim=1:log_path=output_1080.txt:pool=harmonic_meant" -report -f null -
+Frames:   0% 0/610 [00:00<?, ?it/s]
+frame 0: mse=3.741703e-03 psnr=24.269307423526392 saved -> outputs/recon_frames/new_train/n1_epo03_clip_01_padded/frame_00000.png
+Frames:   0% 1/610 [00:01<14:07,  1.39s/it]
+frame 1: mse=1.126068e-03 psnr=29.48435538525116 saved -> outputs/recon_frames/new_train/n1_epo03_clip_01_padded/frame_00001.png
+Frames:   0% 2/610 [00:02<13:52,  1.37s/it]
+frame 2: mse=1.228063e-03 psnr=29.1077934679906 saved -> outputs/recon_frames/new_train/n1_epo03_clip_01_padded/frame_00002.png
+Frames:   5% 29/610 [00:41<14:17,  1.48s/it]
+--- DPB refresh at frame 30 using last_good_frame ---
+Frames:  10% 59/610 [01:25<13:35,  1.48s/it]
+--- DPB refresh at frame 60 using last_good_frame ---
+Frames:  15% 89/610 [02:09<12:55,  1.49s/it]
+--- DPB refresh at frame 90 using last_good_frame ---
+Frames:  20% 119/610 [02:53<12:16,  1.50s/it]
+--- DPB refresh at frame 120 using last_good_frame ---
+Frames:  24% 149/610 [03:37<11:31,  1.50s/it]
+--- DPB refresh at frame 150 using last_good_frame ---
+Frames:  29% 179/610 [04:21<10:37,  1.48s/it]
+--- DPB refresh at frame 180 using last_good_frame ---
+Frames:  34% 209/610 [05:05<09:47,  1.46s/it]
+--- DPB refresh at frame 210 using last_good_frame ---
+Frames:  39% 239/610 [05:48<09:00,  1.46s/it]
+--- DPB refresh at frame 240 using last_good_frame ---
+Frames:  44% 269/610 [06:31<08:02,  1.42s/it]
+--- DPB refresh at frame 270 using last_good_frame ---
+Frames:  44% 270/610 [06:32<08:02,  1.42s/it]
+--- DPB refresh at frame 300 using last_good_frame ---
+Frames:  49% 300/610 [07:14<07:13,  1.40s/it]
+--- DPB refresh at frame 330 using last_good_frame ---
+Frames:  54% 330/610 [07:56<06:29,  1.39s/it]
+--- DPB refresh at frame 360 using last_good_frame ---
+Frames:  59% 360/610 [08:37<05:58,  1.43s/it]
+--- DPB refresh at frame 390 using last_good_frame ---
+Frames:  64% 390/610 [09:22<05:34,  1.52s/it]
+--- DPB refresh at frame 420 using last_good_frame ---
+Frames:  69% 420/610 [10:07<04:43,  1.49s/it]
+--- DPB refresh at frame 450 using last_good_frame ---
+Frames:  79% 479/610 [11:36<03:15,  1.49s/it]
+--- DPB refresh at frame 480 using last_good_frame ---
+Frames:  83% 504/610 [12:13<02:40,  1.51s/it]
+Warning: bad frame 504 detected (mse large or non-finite). Replaced with last_good_frame.
+Frames:  83% 505/610 [12:14<02:38,  1.51s/it]
+Warning: bad frame 505 detected (mse large or non-finite). Replaced with last_good_frame.
+Frames:  83% 506/610 [12:16<02:36,  1.51s/it]
+Warning: bad frame 506 detected (mse large or non-finite). Replaced with last_good_frame.
+Frames:  83% 507/610 [12:17<02:35,  1.51s/it]
+Warning: bad frame 507 detected (mse large or non-finite). Replaced with last_good_frame.
+Frames:  83% 508/610 [12:19<02:34,  1.51s/it]
+Warning: bad frame 508 detected (mse large or non-finite). Replaced with last_good_frame.
+Frames:  83% 509/610 [12:20<02:32,  1.51s/it]
+Warning: bad frame 509 detected (mse large or non-finite). Replaced with last_good_frame.
+--- DPB refresh at frame 510 using last_good_frame ---
+Frames:  84% 510/610 [12:22<02:31,  1.51s/it]
+Warning: bad frame 510 detected (mse large or non-finite). Replaced with last_good_frame.
+Frames:  84% 511/610 [12:23<02:29,  1.51s/it]
+--- DPB refresh at frame 540 using last_good_frame ---
+Frames:  89% 540/610 [13:02<01:30,  1.29s/it]
+--- DPB refresh at frame 570 using last_good_frame ---
+Frames:  93% 570/610 [13:39<00:47,  1.18s/it]
+--- DPB refresh at frame 600 using last_good_frame ---
+Frames:  98% 600/610 [14:14<00:10,  1.07s/it]
+Done. frames: 610 avg_mse: 0.013184531828766444 avg_psnr (finite only): 25.13195068700379
+Saved reconstructed frames to: outputs/recon_frames/new_train/n1_epo03_clip_01_padded
