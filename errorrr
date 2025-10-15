@@ -1,2 +1,5 @@
-Loaded checkpoint: ./checkpoints_finetune_lambda0.01/best_epoch001.pth.tar
-Done. Found 0 bad frames.
+I use this one works perfectly
+!ffmpeg -y -framerate 60 -i outputs/recon_frames/new_train/epo26_clip_01_padded/frame_%05d.png -c:v libx264 -pix_fmt yuv420p outputs/recon_frames/new_train/epo26_clip_01_padded/recon_clip_01_30ep_0026cp_30buffer.mp4
+ but i am trying to use this one not working
+
+!ffmpeg.exe -i outputs/recon_frames/new_train/epo26_clip_01_padded/recon_clip_01_30ep_0026cp_30buffer.mp4 -i data/train_videos/clip_01.mp4 -filter_complex "psnr=1:ssim=1:log_path=output_1080.txt:pool=harmonic_meant" -report -f null -
