@@ -1,7 +1,12 @@
-python - <<'PY'
+# Cell 1 — quick import test for compiled extension
+import traceback, sys
+
+print("Python:", sys.executable)
+print("Working dir:", __import__("os").getcwd())
+
 try:
     import MLCodec_extensions_cpp as mc
-    print("MLCodec_extensions_cpp import OK:", mc)
-except Exception as e:
-    print("MLCodec_extensions_cpp import FAILED:", repr(e))
-PY
+    print("✅ MLCodec_extensions_cpp imported successfully:", mc)
+except Exception:
+    print("❌ MLCodec_extensions_cpp import FAILED. Full traceback:")
+    traceback.print_exc()
