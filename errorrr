@@ -1,22 +1,26 @@
-# Cell 1 — quick import test for compiled extension
-import traceback, sys
+# Cell A: repo search for native extension sources
+import os, glob, textwrap
+root = os.getcwd()
+print("Repo root:", root)
 
-print("Python:", sys.executable)
-print("Working dir:", __import__("os").getcwd())
+# look for likely extension package names
+candidates = []
+for d, _, files in os.walk(root):
+    for fname in files:
+        if fname.endswith(('.cpp', '.cxx', '.cc', '.cu', 'CMakeLists.txt', 'setup.py', 'pyproject.toml')):
+            candidates.append(d)
+            break
 
-try:
-    import MLCodec_extensions_cpp as mc
-    print("✅ MLCodec_extensions_cpp imported successfully:", mc)
-except Exception:
-    print("❌ MLCodec_extensions_cpp import FAILED. Full traceback:")
-    traceback.print_exc()
+candidates = sorted(set(candidates))
+print(f"Found {len(candidates)} directories containing native build artifacts (first 40):")
+for p in candidates[:40]:
+    print(" -", os.path.relpath(p, root))
+print()
 
+# Also search for MLCodec_extensions_cpp literal
+matches = glob.glob("**/MLCodec_extensions_cpp*", recursive=True)
+print("Paths matching 'MLCodec_extensions_cpp*':", matches)
 
-
-Python: /home/work/dcvc/miniconda3/envs/dcvc_env/bin/python
-Working dir: /home/work/dcvc/DCVC_n
-❌ MLCodec_extensions_cpp import FAILED. Full traceback:
-Traceback (most recent call last):
-  File "/tmp/ipykernel_369/523512363.py", line 8, in <module>
-    import MLCodec_extensions_cpp as mc
-ModuleNotFoundError: No module named 'MLCodec_extensions_cpp'
+# show top-level listing for quick inspection
+print("\nTop-level files/dirs:")
+print(sorted(os.listdir(root)))
