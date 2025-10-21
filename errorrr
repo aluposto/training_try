@@ -1,19 +1,12 @@
 cannot import cuda implementation for inference, fallback to pytorch.
 device: cuda
 Loaded checkpoint: ./checkpoints_new_lambda0.01/best_epoch026.pth.tar
-model.update() failed or not needed (continuing without compiled coder).
-Encoding frames:   0%|                                  | 0/610 [00:00<?, ?it/s]Warning: model.compress() failed for frame 0: 'NoneType' object has no attribute 'reset'
-Encoding frames:   0%|                          | 1/610 [00:02<21:44,  2.14s/it]Warning: model.compress() failed for frame 1: 'NoneType' object has no attribute 'reset'
-Encoding frames:   0%|                          | 2/610 [00:02<10:55,  1.08s/it]Warning: model.compress() failed for frame 2: 'NoneType' object has no attribute 'reset'
-Encoding frames:   0%|▏                         | 3/610 [00:02<07:47,  1.30it/s]Warning: model.compress() failed for frame 3: 'NoneType' object has no attribute 'reset'
-Encoding frames:   1%|▏                         | 4/610 [00:03<05:41,  1.77it/s]Warning: model.compress() failed for frame 4: 'NoneType' object has no attribute 'reset'
-Warning: model.compress() failed for frame 5: 'NoneType' object has no attribute 'reset'
-Encoding frames:   1%|▎                         | 6/610 [00:03<03:07,  3.22it/s]Warning: model.compress() failed for frame 6: 'NoneType' object has no attribute 'reset'
-Warning: model.compress() failed for frame 7: 'NoneType' object has no attribute 'reset'
-Encoding frames:   1%|▎                         | 8/610 [00:03<02:08,  4.69it/s]Warning: model.compress() failed for frame 8: 'NoneType' object has no attribute 'reset'
-Warning: model.compress() failed for frame 9: 'NoneType' object has no attribute 'reset'
-Encoding frames:   2%|▍                        | 10/610 [00:03<01:39,  6.06it/s]Warning: model.compress() failed for frame 10: 'NoneType' object has no attribute 'reset'
-Warning: model.compress() failed for frame 11: 'NoneType' object has no attribute 'reset'
-Encoding frames:   2%|▍                        | 12/610 [00:03<01:20,  7.43it/s]Warning: model.compress() failed for frame 12: 'NoneType' object has no attribute 'reset'
-Warning: model.compress() failed for frame 13: 'NoneType' object has no attribute 'reset'
-Encoding frames:   2%|▌                        | 14/610 [00:03<01:10,  8.50it/s]Warning: model.compress() failed for frame 14: 'NoneType' object has no attribute 'reset'
+Compiled codec backend NOT available or not initialized.
+Decoding frames: 100%|████████████████████████| 610/610 [06:54<00:00,  1.47it/s]
+Done. frames decoded: 610
+Average MSE: 0.0
+Average PSNR (finite only): nan
+Per-frame PSNR saved to: decoded/clip_01_dec/psnr_per_frame.csv
+
+To assemble decoded frames into a video (example using ffmpeg):
+  ffmpeg -y -framerate 30 -i decoded/clip_01_dec/frame_%05d.png -c:v libx264 -pix_fmt yuv420p decoded/clip_01_dec/recon_video.mp4
