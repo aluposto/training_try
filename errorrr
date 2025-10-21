@@ -1,26 +1,24 @@
-# Cell A: repo search for native extension sources
-import os, glob, textwrap
-root = os.getcwd()
-print("Repo root:", root)
+# Cell B: system and PyTorch info (run in Python cell)
+import shutil, subprocess, sys, torch, os
+print("Python:", sys.executable)
+print("torch.__version__:", torch.__version__)
+print("torch.version.cuda:", torch.version.cuda)
+print("CUDA available in torch?:", torch.cuda.is_available())
+print("torch.cuda.device_count():", torch.cuda.device_count())
+print("CUDA_HOME / CUDA_PATH env:", os.getenv("CUDA_HOME"), os.getenv("CUDA_PATH"))
 
-# look for likely extension package names
-candidates = []
-for d, _, files in os.walk(root):
-    for fname in files:
-        if fname.endswith(('.cpp', '.cxx', '.cc', '.cu', 'CMakeLists.txt', 'setup.py', 'pyproject.toml')):
-            candidates.append(d)
-            break
+def which(cmd):
+    p = shutil.which(cmd)
+    return p if p else "<not found>"
 
-candidates = sorted(set(candidates))
-print(f"Found {len(candidates)} directories containing native build artifacts (first 40):")
-for p in candidates[:40]:
-    print(" -", os.path.relpath(p, root))
-print()
+print("nvcc:", which("nvcc"))
+print("gcc:", which("gcc"))
+print("g++:", which("g++"))
 
-# Also search for MLCodec_extensions_cpp literal
-matches = glob.glob("**/MLCodec_extensions_cpp*", recursive=True)
-print("Paths matching 'MLCodec_extensions_cpp*':", matches)
-
-# show top-level listing for quick inspection
-print("\nTop-level files/dirs:")
-print(sorted(os.listdir(root)))
+# print nvcc version if available
+if which("nvcc") != "<not found>":
+    try:
+        print("nvcc --version:")
+        print(subprocess.check_output(["nvcc", "--version"], stderr=subprocess.STDOUT).decode())
+    except Exception as e:
+        print("nvcc --version failed:", e)
