@@ -22,3 +22,21 @@ if which("nvcc") != "<not found>":
         print(subprocess.check_output(["nvcc", "--version"], stderr=subprocess.STDOUT).decode())
     except Exception as e:
         print("nvcc --version failed:", e)
+
+
+
+Python: /home/work/dcvc/miniconda3/envs/dcvc_env/bin/python
+torch.__version__: 2.8.0+cu126
+torch.version.cuda: 12.6
+CUDA available in torch?: True
+torch.cuda.device_count(): 2
+CUDA_HOME / CUDA_PATH env: /usr/local/cuda None
+nvcc: /usr/local/cuda/bin/nvcc
+gcc: /usr/bin/gcc
+g++: /usr/bin/g++
+nvcc --version:
+nvcc: NVIDIA (R) Cuda compiler driver
+Copyright (c) 2005-2023 NVIDIA Corporation
+Built on Tue_Jul_11_02:20:44_PDT_2023
+Cuda compilation tools, release 12.2, V12.2.128
+Build cuda_12.2.r12.2/compiler.33053471_0
