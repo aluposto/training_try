@@ -10,3 +10,13 @@ try:
 except Exception:
     print("❌ MLCodec_extensions_cpp import FAILED. Full traceback:")
     traceback.print_exc()
+
+
+
+Python: /home/work/dcvc/miniconda3/envs/dcvc_env/bin/python
+Working dir: /home/work/dcvc/DCVC_n
+❌ MLCodec_extensions_cpp import FAILED. Full traceback:
+Traceback (most recent call last):
+  File "/tmp/ipykernel_369/523512363.py", line 8, in <module>
+    import MLCodec_extensions_cpp as mc
+ModuleNotFoundError: No module named 'MLCodec_extensions_cpp'
