@@ -1,12 +1,7 @@
-cannot import cuda implementation for inference, fallback to pytorch.
-device: cuda
-Loaded checkpoint: ./checkpoints_new_lambda0.01/best_epoch026.pth.tar
-Compiled codec backend NOT available or not initialized.
-Decoding frames: 100%|████████████████████████| 610/610 [06:54<00:00,  1.47it/s]
-Done. frames decoded: 610
-Average MSE: 0.0
-Average PSNR (finite only): nan
-Per-frame PSNR saved to: decoded/clip_01_dec/psnr_per_frame.csv
-
-To assemble decoded frames into a video (example using ffmpeg):
-  ffmpeg -y -framerate 30 -i decoded/clip_01_dec/frame_%05d.png -c:v libx264 -pix_fmt yuv420p decoded/clip_01_dec/recon_video.mp4
+python - <<'PY'
+try:
+    import MLCodec_extensions_cpp as mc
+    print("MLCodec_extensions_cpp import OK:", mc)
+except Exception as e:
+    print("MLCodec_extensions_cpp import FAILED:", repr(e))
+PY
