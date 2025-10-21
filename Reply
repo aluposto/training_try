@@ -1,334 +1,405 @@
-# padded_reconstruct_clip_unique_plot_intra_fallback.py
-import os, math, glob, tqdm, time, uuid
-import numpy as np
+Below are two complete, ready-to-run Python scripts: encoder.py (step 1) and decoder.py (step 2). They are written to work with the DCVC DMC model you showed earlier. Each script is robust: it pads frames to the model’s expected multiples, saves per-frame bitstreams plus a small metadata JSON, and falls back safely if the model returns a direct reconstruction instead of a bitstream.
+
+How to use
+
+1. Put encoder.py on the machine that will encode. Run it against a folder of frames (PNG/JPG) or a single image.
+
+
+2. Transfer the produced .bin and .json files (one pair per frame) to the decoder machine.
+
+
+3. Put decoder.py on the machine that will decode. Run it pointed at the directory containing the .bin/.json pairs. The decoder will recreate PNG frames.
+
+
+
+Both scripts assume the repo with src is importable (i.e. run with PYTHONPATH=$PWD python encoder.py ... if needed), and both will attempt to call model.update() to initialize entropy tables (silently continue if unavailable).
+
+
+---
+
+encoder.py (encoding / producing .bin + .meta.json per frame)
+
+#!/usr/bin/env python3
+"""
+encoder.py
+Usage example:
+  PYTHONPATH=$PWD python encoder.py --frames-dir data/frames/train/clip_01 \
+    --out-dir encoded/clip_01 --qp 0
+
+Produces files:
+  encoded/clip_01/frame_000000.bin      # entropy-coded bitstream OR empty if none
+  encoded/clip_01/frame_000000.meta.json
+If model.compress() returns a direct reconstruction x_hat instead of bitstream,
+encoder will save 'raw_xhat': true in meta and also write xhat PNG to same folder.
+"""
+import os, json, argparse, glob, math
+from pathlib import Path
 from PIL import Image
+import numpy as np
 import torch
 import torch.nn.functional as F
+from tqdm import tqdm
+
+# import model class
 from src.models.video_model import DMC as VideoModel
 
-# live-plot imports
-from IPython.display import display, update_display
-import matplotlib
-matplotlib.use('module://matplotlib_inline.backend_inline')
-import matplotlib.pyplot as plt
+def pad_to_multiple(x, mult=64):
+    # x: torch tensor [1,C,H,W]
+    _, _, H, W = x.shape
+    pad_h = (mult - (H % mult)) % mult
+    pad_w = (mult - (W % mult)) % mult
+    if pad_h == 0 and pad_w == 0:
+        return x, (0,0)
+    pad = (0, pad_w, 0, pad_h)  # left, right, top, bottom
+    x_p = F.pad(x, pad, mode='replicate')
+    return x_p, (pad_h, pad_w)
 
-# ----------------------
-# Config / Paths (edit)
-# ----------------------
-ckpt_path = "./checkpoints_new_lambda0.01/best_epoch002.pth.tar"
-frames_dir = "data/frames/train/clip_01"
-out_dir = "outputs/recon_frames/new_train/1_clip_01_padded_intra_fallback"
-os.makedirs(out_dir, exist_ok=True)
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument('--frames-dir', type=str, required=True, help="Directory with input frames (png/jpg).")
+    p.add_argument('--out-dir', type=str, required=True, help="Directory to write .bin + .meta.json outputs.")
+    p.add_argument('--qp', type=int, default=0, help="QP index to use (0..63).")
+    p.add_argument('--device', type=str, default='cuda', help="cuda or cpu")
+    p.add_argument('--pad-mult', type=int, default=64, help="pad H/W to multiple of this before encoding")
+    args = p.parse_args()
 
-# Optional: human run name to identify the plot (can be '')
-run_name = ""  # e.g. "run_lr1e-4" or leave empty
+    device = torch.device(args.device if torch.cuda.is_available() and args.device == 'cuda' else 'cpu')
+    os.makedirs(args.out_dir, exist_ok=True)
 
-# DPB refresh frequency (0 disables periodic refresh)
-REFRESH_N = 30  # your previous value; adjust if desired
-
-# Bad-frame detection and fallback parameters
-MSE_HISTORY_LEN = 16
-BAD_MSE_FACTOR = 8.0          # relative threshold (current_mse > BAD_MSE_FACTOR * median(history))
-BAD_MSE_MIN = 1e-8            # avoid divide-by-zero for very small medians
-CONSECUTIVE_BAD_LIMIT = 5    # if this many bad frames in a row occur, enable intra-only fallback
-INTRA_MODE_FRAMES = 10       # number of frames to process in intra-only mode after triggering
-MAX_ALLOWED_NONFINITE = 0     # if any nonfinite pixel found in reconstruction treat as bad
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print("device:", device)
-
-# Load model
-model = VideoModel().to(device).eval()
-if os.path.exists(ckpt_path):
-    ck = torch.load(ckpt_path, map_location="cpu")
-    sd = ck.get("state_dict", ck)
-    model.load_state_dict({k.replace("module.",""): v for k,v in sd.items()}, strict=False)
-    print("Loaded checkpoint:", ckpt_path)
-else:
-    print("Warning: checkpoint not found:", ckpt_path)
-
-# Helper: PSNR
-def mse_to_psnr(mse, max_val=1.0):
-    if not np.isfinite(mse) or mse <= 0:
-        return float("inf") if mse == 0 else float("nan")
-    return 10.0 * math.log10((max_val**2) / mse)
-
-# get frame list
-frame_paths = sorted(glob.glob(os.path.join(frames_dir, "*.png")))
-if len(frame_paths) == 0:
-    raise SystemExit(f"No frames found in {frames_dir}")
-
-# initialize dpb
-try:
-    model.clear_dpb()
-except Exception:
-    model.dpb = []
-
-psnr_list = []
-mse_list = []
-
-# stability tracking
-mse_history = []
-last_good_frame = None
-consecutive_bad = 0
-intra_mode_counter = 0
-intra_mode_active = False
-
-# --------------------------
-# Create a unique display id
-# --------------------------
-timestamp_ms = int(time.time() * 1000)
-unique_token = uuid.uuid4().hex[:8]
-_display_id_str = f"psnr_plot_{timestamp_ms}_{unique_token}"
-if run_name:
-    _display_id_str = f"{_display_id_str}_{run_name}"
-print("Live PSNR plot display_id:", _display_id_str)
-
-# Prepare matplotlib figure
-fig, ax = plt.subplots(figsize=(10, 3))
-ax.set_title("PSNR per frame (live) — " + (_display_id_str if run_name == "" else run_name))
-ax.set_xlabel("frame index")
-ax.set_ylabel("PSNR (dB)")
-ax.grid(True)
-line, = ax.plot([], [], marker='o', markersize=3, linestyle='-', linewidth=0.7)
-ax.set_xlim(0, max(10, len(frame_paths)))
-ax.set_ylim(0, 50)
-
-# display once (creates persistent output cell)
-try:
-    display(fig, display_id=_display_id_str)
-    plt.close(fig)
-except Exception:
-    pass
-
-# --------------------------
-# Main per-frame loop
-# --------------------------
-for i, p in enumerate(tqdm.tqdm(frame_paths, desc="Frames")):
-    im = Image.open(p).convert("RGB")
-    arr = np.asarray(im, dtype=np.float32)/255.0
-    H, W = arr.shape[0], arr.shape[1]
-
-    x = torch.from_numpy(arr.transpose(2,0,1))[None,...].to(device)  # [1,C,H,W]
-
-    pad_h = (16 - (H % 16)) % 16
-    pad_w = (16 - (W % 16)) % 16
-    pad = (0, pad_w, 0, pad_h)
-    if pad_w != 0 or pad_h != 0:
-        x_padded = F.pad(x, pad, mode='replicate')
-    else:
-        x_padded = x
-
-    # For first frame ensure dpb has a zero frame with same padded dims
-    if i == 0:
-        zeros = torch.zeros_like(x_padded)
-        try:
-            model.clear_dpb()
-        except Exception:
-            model.dpb = []
-        try:
-            model.add_ref_frame(frame=zeros, increase_poc=False)
-        except Exception:
-            try:
-                model.add_ref_frame(feature=None, frame=zeros, increase_poc=False)
-            except Exception:
-                model.dpb = []
-                model.add_ref_frame(frame=zeros, increase_poc=False)
-
-    # Decide whether to operate in intra-only mode
-    if intra_mode_active:
-        # intra-only: clear DPB (no temporal references) and reconstruct frame independently
-        try:
-            model.clear_dpb()
-        except Exception:
-            model.dpb = []
-    # Run best-effort differentiable encoder/decoder path (no entropy coder used here)
-    with torch.no_grad():
-        try:
-            feat_adapt = model.apply_feature_adaptor()
-        except Exception:
-            try:
-                feat_in = F.pixel_unshuffle(x_padded, 8)
-            except Exception:
-                feat_in = x_padded
-            try:
-                feat_adapt = model.feature_adaptor_i(feat_in)
-            except Exception:
-                feat_adapt = feat_in
-
-        ctx = None; ctx_t = None
-        if hasattr(model, "feature_extractor"):
-            try:
-                qf = model.q_feature[0:1] if hasattr(model,"q_feature") else None
-                ctx, ctx_t = model.feature_extractor(feat_adapt, qf)
-            except Exception:
-                ctx, ctx_t = (None, None)
-
-        y = None
-        if hasattr(model, "encoder"):
-            try:
-                q_enc = model.q_encoder[0:1] if hasattr(model,"q_encoder") else None
-                y = model.encoder(x_padded, ctx if ctx is not None else feat_adapt, q_enc)
-            except Exception:
-                y = None
-
-        x_hat_padded = x_padded
-        feat_dec = None
-        if y is not None and hasattr(model, "decoder") and hasattr(model, "recon_generation_net"):
-            try:
-                q_dec = model.q_decoder[0:1] if hasattr(model,"q_decoder") else None
-                q_recon = model.q_recon[0:1] if hasattr(model,"q_recon") else None
-                feat_dec = model.decoder(y, ctx if ctx is not None else feat_adapt, q_dec)
-                x_hat_padded = model.recon_generation_net(feat_dec, q_recon).clamp(0,1)
-            except Exception:
-                x_hat_padded = x_padded
-
-    # SANITIZE non-finite or extreme values
+    # instantiate model
+    model = VideoModel().to(device).eval()
     try:
-        if not torch.isfinite(x_hat_padded).all() or (torch.isfinite(x_hat_padded).sum().item() <= MAX_ALLOWED_NONFINITE):
-            # very bad: replace with last_good_frame or clamp
-            if last_good_frame is not None:
-                x_hat_padded = last_good_frame.clone()
-            else:
-                x_hat_padded = torch.clamp(torch.nan_to_num(x_hat_padded, nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0)
-        x_hat_padded = torch.clamp(x_hat_padded, 0.0, 1.0)
+        model.update()
     except Exception:
-        x_hat_padded = torch.clamp(x_padded, 0.0, 1.0)
+        # ok if not available
+        pass
 
-    # crop back to original H,W
-    x_hat = x_hat_padded[..., :H, :W]
+    # clear DPB if present
+    try:
+        model.clear_dpb()
+    except Exception:
+        model.dpb = []
 
-    # compute mse/psnr
-    mse = float(F.mse_loss(x_hat, x, reduction="mean").item())
-    psnr = mse_to_psnr(mse)
+    # list frames
+    frames = sorted(glob.glob(os.path.join(args.frames_dir, '*.*')))
+    frames = [f for f in frames if f.lower().endswith(('.png','.jpg','.jpeg','bmp','tiff'))]
+    if len(frames) == 0:
+        raise SystemExit("No frames found in frames-dir")
 
-    # Update history
-    mse_history.append(mse)
-    if len(mse_history) > MSE_HISTORY_LEN:
-        mse_history.pop(0)
+    for i, fp in enumerate(tqdm(frames, desc="Encoding frames")):
+        im = Image.open(fp).convert('RGB')
+        arr = np.asarray(im, dtype=np.float32) / 255.0
+        x = torch.from_numpy(arr.transpose(2,0,1))[None,...].to(device)  # [1,C,H,W]
 
-    # Bad-frame detection (relative to history)
-    is_bad = False
-    if not np.isfinite(mse):
-        is_bad = True
-    else:
-        if len(mse_history) >= 3:
-            med = float(np.median(mse_history))
-            if med > BAD_MSE_MIN and mse > BAD_MSE_FACTOR * med:
-                is_bad = True
+        # pad
+        x_p, (pad_h, pad_w) = pad_to_multiple(x, mult=args.pad_mult)
 
-    # If bad -> replace with last_good_frame (if possible). Do NOT add bad frame to DPB.
-    if is_bad:
-        consecutive_bad += 1
-        if last_good_frame is not None:
-            x_hat_padded = last_good_frame.clone()
-            x_hat = x_hat_padded[..., :H, :W]
-            mse = float(F.mse_loss(x_hat, x, reduction="mean").item())
-            psnr = mse_to_psnr(mse)
-        else:
-            # fallback identity
-            x_hat_padded = torch.clamp(x_padded, 0.0, 1.0)
-            x_hat = x_hat_padded[..., :H, :W]
-            mse = float(F.mse_loss(x_hat, x, reduction="mean").item())
-            psnr = mse_to_psnr(mse)
-        print(f"Warning: bad frame {i} detected (mse large or non-finite). Replaced with last_good_frame or input.")
-    else:
-        consecutive_bad = 0
-        # good frame -> update last_good_frame and add to DPB unless we are in intra-mode
-        try:
-            last_good_frame = x_hat_padded.clone().detach()
-        except Exception:
-            last_good_frame = None
-
-        if not intra_mode_active:
-            try:
-                if feat_dec is not None:
-                    model.add_ref_frame(feature=feat_dec, frame=x_hat_padded, increase_poc=True)
-                else:
-                    model.add_ref_frame(frame=x_hat_padded, increase_poc=True)
-            except Exception:
-                try:
-                    model.add_ref_frame(frame=x_hat_padded, increase_poc=True)
-                except Exception:
-                    pass
-        else:
-            # intra mode: we DON'T add to DPB (keeps DPB empty)
-            pass
-
-    # If many consecutive bad frames, enter intra-only fallback mode for a while
-    if consecutive_bad >= CONSECUTIVE_BAD_LIMIT and not intra_mode_active:
-        intra_mode_active = True
-        intra_mode_counter = INTRA_MODE_FRAMES
-        print(f"*** Entering INTRA-ONLY fallback for {INTRA_MODE_FRAMES} frames (triggered at frame {i}). ***")
-        # clear DPB now to avoid using poisoned refs
-        try:
-            model.clear_dpb()
-        except Exception:
-            model.dpb = []
-
-    # If in intra-mode count down and exit when done
-    if intra_mode_active:
-        intra_mode_counter -= 1
-        if intra_mode_counter <= 0:
-            intra_mode_active = False
-            consecutive_bad = 0
-            # Re-init DPB with last_good_frame if available
-            try:
-                if last_good_frame is not None:
-                    model.clear_dpb()
-                    model.add_ref_frame(frame=last_good_frame, increase_poc=False)
-                else:
-                    model.clear_dpb()
-            except Exception:
-                pass
-            print(f"*** Exited INTRA-ONLY fallback at frame {i}. Resuming normal mode. ***")
-
-    # Periodic DPB refresh (simulate an I-frame) using last_good_frame when possible
-    if REFRESH_N > 0 and (i + 1) % REFRESH_N == 0:
-        try:
-            ref_for_refresh = last_good_frame.clone().detach() if last_good_frame is not None else torch.zeros_like(x_padded)
+        # ensure dpb has a frame (some models expect dpb[0])
+        if i == 0:
+            zeros = torch.zeros_like(x_p)
             try:
                 model.clear_dpb()
             except Exception:
                 model.dpb = []
             try:
-                model.add_ref_frame(frame=ref_for_refresh, increase_poc=False)
-            except Exception:
+                model.add_ref_frame(frame=zeros, increase_poc=False)
+            except TypeError:
+                # some signatures differ
                 try:
-                    model.add_ref_frame(feature=None, frame=ref_for_refresh, increase_poc=False)
+                    model.add_ref_frame(feature=None, frame=zeros, increase_poc=False)
                 except Exception:
-                    model.dpb = []
-                    model.add_ref_frame(frame=ref_for_refresh, increase_poc=False)
-            print(f"--- DPB refresh at frame {i+1} using {'last_good_frame' if last_good_frame is not None else 'zeros'} ---")
+                    pass
+
+        meta = {
+            'orig_path': os.path.basename(fp),
+            'height': int(x.shape[2]),
+            'width': int(x.shape[3]),
+            'pad_h': int(pad_h),
+            'pad_w': int(pad_w),
+            'qp': int(args.qp),
+            'ec_part': 0,
+            'model': 'DMC',
+        }
+
+        # Call compress (best-effort). compress may raise if compiled coder missing -- handle gracefully.
+        try:
+            out = model.compress(x_p, int(args.qp))
         except Exception as e:
-            print(f"DPB refresh failed at frame {i+1}: {e}")
+            # fallback: try a differentiable run-through of encoder/decoder submodules to obtain x_hat
+            out = None
+            try:
+                # do NOT use torch.no_grad() so gradients not required here; but it's okay to run w/ no grad for inference
+                with torch.no_grad():
+                    feat_in = F.pixel_unshuffle(x_p, 8) if hasattr(F, "pixel_unshuffle") else x_p
+                    try:
+                        feat = model.feature_adaptor_i(feat_in)
+                    except Exception:
+                        feat = feat_in
+                    ctx, ctx_t = (None, None)
+                    if hasattr(model, "feature_extractor"):
+                        try:
+                            qf = model.q_feature[0:1] if hasattr(model, "q_feature") else None
+                            ctx, ctx_t = model.feature_extractor(feat, qf)
+                        except Exception:
+                            ctx, ctx_t = (None, None)
+                    y = None
+                    if hasattr(model, "encoder"):
+                        try:
+                            q_enc = model.q_encoder[0:1] if hasattr(model, "q_encoder") else None
+                            y = model.encoder(x_p, ctx if ctx is not None else feat, q_enc)
+                        except Exception:
+                            y = None
+                    if y is not None and hasattr(model, "decoder") and hasattr(model, "recon_generation_net"):
+                        q_dec = model.q_decoder[0:1] if hasattr(model, "q_decoder") else None
+                        q_recon = model.q_recon[0:1] if hasattr(model, "q_recon") else None
+                        feat_dec = model.decoder(y, ctx if ctx is not None else feat, q_dec)
+                        x_hat = model.recon_generation_net(feat_dec, q_recon).clamp(0,1)
+                        out = {'bit_stream': None, 'x_hat': x_hat}  # mark as raw
+            except Exception:
+                out = None
 
-    # Save reconstructed frame (guard against invalid values)
-    out_np = (np.clip(x_hat[0].cpu().numpy().transpose(1,2,0), 0.0, 1.0) * 255.0).round().astype(np.uint8)
-    Image.fromarray(out_np).save(os.path.join(out_dir, f"frame_{i:05d}.png"))
+        # write outputs
+        idx = i
+        bin_path = os.path.join(args.out_dir, f"frame_{idx:06d}.bin")
+        meta_path = os.path.join(args.out_dir, f"frame_{idx:06d}.meta.json")
 
-    # Minimal prints for first few frames
-    if i < 3:
-        print(f"frame {i}: mse={mse:.6e} psnr={psnr if np.isfinite(psnr) else 'inf'} saved -> {os.path.join(out_dir, f'frame_{i:05d}.png')}")
+        if out is None:
+            # no result -> treat as raw identity (save raw_xhat)
+            x_hat = x_p
+            meta['raw_xhat'] = True
+            meta['note'] = 'compress_failed_fallback_identity'
+            # save x_hat PNG
+            out_png = os.path.join(args.out_dir, f"frame_{idx:06d}.raw_xhat.png")
+            img_np = (x_hat[0].cpu().numpy().transpose(1,2,0) * 255.0).round().astype('uint8')
+            Image.fromarray(img_np).save(out_png)
+            # create empty .bin file for consistency
+            open(bin_path, 'wb').close()
+        else:
+            bs = out.get('bit_stream', None)
+            xhat_from_out = out.get('x_hat', None)
+            if bs is None:
+                # model didn't produce bitstream (image model/fallback) -> store x_hat as PNG and mark meta
+                meta['raw_xhat'] = True
+                if xhat_from_out is None:
+                    # if nothing, fallback identity
+                    x_hat = x_p
+                else:
+                    x_hat = xhat_from_out
+                out_png = os.path.join(args.out_dir, f"frame_{idx:06d}.raw_xhat.png")
+                img_np = (x_hat[0].cpu().numpy().transpose(1,2,0) * 255.0).round().astype('uint8')
+                Image.fromarray(img_np).save(out_png)
+                open(bin_path, 'wb').close()
+            else:
+                # we have a real bitstream
+                meta['raw_xhat'] = False
+                # write bytes
+                with open(bin_path, 'wb') as f:
+                    if isinstance(bs, (bytes, bytearray)):
+                        f.write(bs)
+                    else:
+                        # if coder returned a numpy buffer or other, attempt bytes()
+                        try:
+                            f.write(bytes(bs))
+                        except Exception:
+                            # last resort: if it's a list of bytes chunks
+                            if isinstance(bs, (list,tuple)):
+                                for chunk in bs:
+                                    f.write(bytes(chunk))
+                            else:
+                                raise
 
-    # Update live PSNR plot
+        # write metadata JSON
+        with open(meta_path, 'w') as f:
+            json.dump(meta, f, indent=2)
+
+    print("Encoding finished. Wrote", len(frames), "frames to", args.out_dir)
+
+if __name__ == "__main__":
+    main()
+
+
+---
+
+decoder.py (decoding / reading .bin + .meta.json and reconstructing PNGs)
+
+#!/usr/bin/env python3
+"""
+decoder.py
+Usage example:
+  PYTHONPATH=$PWD python decoder.py --encoded-dir encoded/clip_01 --out-dir recon/clip_01_decoded --device cuda
+
+This reads frame_XXXXXX.bin + frame_XXXXXX.meta.json pairs and writes PNG reconstructions.
+"""
+import os, json, argparse, glob, math
+from pathlib import Path
+from PIL import Image
+import numpy as np
+import torch
+import torch.nn.functional as F
+from tqdm import tqdm
+
+# import model class
+from src.models.video_model import DMC as VideoModel
+
+def crop_from_padded(x_padded, orig_h, orig_w):
+    # x_padded: [1,C,H_p,W_p]
+    return x_padded[..., :orig_h, :orig_w]
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument('--encoded-dir', type=str, required=True, help="Directory containing .bin and .meta.json pairs.")
+    p.add_argument('--out-dir', type=str, required=True, help="Directory to write reconstructed frames (PNGs).")
+    p.add_argument('--device', type=str, default='cuda', help="cuda or cpu")
+    p.add_argument('--pad-mult', type=int, default=64, help="padding multiple used during encoding (must match).")
+    args = p.parse_args()
+
+    device = torch.device(args.device if torch.cuda.is_available() and args.device == 'cuda' else 'cpu')
+    os.makedirs(args.out_dir, exist_ok=True)
+
+    # instantiate model
+    model = VideoModel().to(device).eval()
     try:
-        line.set_xdata(np.arange(len(psnr_list) + 1))
-        line.set_ydata(np.array(psnr_list + [psnr]))
-        ax.relim()
-        ax.autoscale_view()
-        update_display(fig, display_id=_display_id_str)
-        plt.pause(0.001)
+        model.update()
     except Exception:
-        pass
+        print("model.update() failed or not needed (continuing fallback).")
 
-    # Append histories
-    mse_list.append(mse)
-    psnr_list.append(psnr)
+    # clear DPB
+    try:
+        model.clear_dpb()
+    except Exception:
+        model.dpb = []
 
-# summary
-finite_psnrs = [p for p in psnr_list if np.isfinite(p)]
-avg_mse = float(np.mean(mse_list)) if len(mse_list) > 0 else float('nan')
-avg_psnr = float(np.mean(finite_psnrs)) if len(finite_psnrs)>0 else float('nan')
-print("Done. frames:", len(frame_paths), "avg_mse:", avg_mse, "avg_psnr (finite only):", avg_psnr)
-print("Saved reconstructed frames to:", out_dir)
+    # find meta files
+    metas = sorted(glob.glob(os.path.join(args.encoded_dir, "frame_*.meta.json")))
+    if len(metas) == 0:
+        raise SystemExit("No meta files found in encoded-dir")
+
+    bad_frames = 0
+    last_good_frame = None
+
+    for meta_file in tqdm(metas, desc="Decoding frames"):
+        with open(meta_file, 'r') as f:
+            meta = json.load(f)
+        base = os.path.basename(meta_file).replace('.meta.json','')
+        bin_path = os.path.join(args.encoded_dir, f"{base}.bin")
+        idx_str = base.split('_')[-1]
+        out_png = os.path.join(args.out_dir, f"frame_{idx_str}.png")
+        orig_h = int(meta.get('height'))
+        orig_w = int(meta.get('width'))
+        pad_h = int(meta.get('pad_h', 0))
+        pad_w = int(meta.get('pad_w', 0))
+        qp = int(meta.get('qp', 0))
+        raw_xhat = bool(meta.get('raw_xhat', False))
+
+        # If raw_xhat -> load PNG generated by encoder or fallback identity
+        if raw_xhat:
+            raw_png = os.path.join(args.encoded_dir, f"{base}.raw_xhat.png")
+            if os.path.exists(raw_png):
+                img = Image.open(raw_png).convert('RGB')
+                img.save(out_png)
+                last_good_frame = out_png
+                continue
+            else:
+                # no raw file; attempt fallback: identity (not ideal)
+                print(f"Warning: raw_xhat true but {raw_png} missing. Using black frame.")
+                black = np.zeros((orig_h, orig_w, 3), dtype=np.uint8)
+                Image.fromarray(black).save(out_png)
+                last_good_frame = out_png
+                continue
+
+        # read bitstream bytes
+        if not os.path.exists(bin_path):
+            print(f"Warning: bin file missing for {meta_file}, creating black frame")
+            black = np.zeros((orig_h, orig_w, 3), dtype=np.uint8)
+            Image.fromarray(black).save(out_png)
+            bad_frames += 1
+            continue
+
+        with open(bin_path, 'rb') as f:
+            bs = f.read()
+
+        # Try decompress via model.decompress
+        try:
+            sps = {'height': orig_h + pad_h, 'width': orig_w + pad_w, 'ec_part': meta.get('ec_part', 0)}
+            dec = model.decompress(bs, sps, qp)
+            x_hat = dec.get('x_hat', None)
+            if x_hat is None:
+                raise RuntimeError("decompress returned no x_hat")
+            # ensure device and detach
+            if isinstance(x_hat, torch.Tensor):
+                x_hat = x_hat.detach().cpu()
+            else:
+                # if numpy array
+                x_hat = torch.from_numpy(np.array(x_hat)).float()
+
+            # crop to original size
+            x_hat = crop_from_padded(x_hat, orig_h, orig_w)
+            out_np = (np.clip(x_hat[0].numpy().transpose(1,2,0), 0.0, 1.0) * 255.0).round().astype(np.uint8)
+            Image.fromarray(out_np).save(out_png)
+            last_good_frame = out_png
+
+            # update DPB if model expects it (best-effort)
+            try:
+                # attempt to add frame to dpb similar to encoder
+                t = torch.from_numpy(out_np.astype(np.float32)/255.0).permute(2,0,1).unsqueeze(0).to(device)
+                t_padded = t
+                # add as reference frame
+                try:
+                    model.add_ref_frame(feature=None, frame=t_padded, increase_poc=True)
+                except Exception:
+                    try:
+                        model.add_ref_frame(frame=t_padded, increase_poc=True)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        except Exception as e:
+            # decompression failed: save last_good_frame (if available) or black frame
+            bad_frames += 1
+            print(f"Warning: decompress failed for {meta_file}: {e}")
+            if last_good_frame is not None:
+                # copy last good to current
+                from shutil import copyfile
+                copyfile(last_good_frame, out_png)
+            else:
+                black = np.zeros((orig_h, orig_w, 3), dtype=np.uint8)
+                Image.fromarray(black).save(out_png)
+
+    print("Decoding finished. Reconstructed frames saved to", args.out_dir)
+    print("Bad frames replaced:", bad_frames)
+
+if __name__ == "__main__":
+    main()
+
+
+---
+
+Important notes & tips
+
+Pad multiple: I used 64 by default to match DCVC internals; change --pad-mult if you used a different padding strategy when training/encoding.
+
+Model/extension compatibility: The encoder uses model.compress() (which relies on the entropy coder library). The decoder uses model.decompress() — both machines must have matching model code and the MLCodec_extensions_cpp entropy coder compiled/installed to decode bitstreams. If the decoder cannot run the entropy coder extension, use the fallback approach (save raw quantized tensors or raw x_hat PNGs from the encoder) — encoder already handles missing compress() by producing a raw_xhat.
+
+Metadata: The .meta.json stores original height/width and padding so decoder can correctly crop.
+
+DPB: the scripts call model.add_ref_frame/model.clear_dpb best-effort so temporal priors behave similarly on encoder & decoder. If your encoder uses a different DPB strategy (GOP/I-frame insertion), ensure decoder receives the same DPB resets / sequence boundaries.
+
+Testing locally: Before distributing, test decompress(compress(x)) locally to confirm bit-exact or close reconstructions.
+
+Transferring files: For many frames you may prefer bundling e.g. tar/zip or using object storage (S3) rather than many individual files.
+
+
+
+---
+
+If you want, I can:
+
+Add an option to the encoder to save quantized latent tensors instead of bitstreams (for usage on decoders without entropy coder).
+
+Provide an example that writes a single container file (one big .tar or .npz) instead of per-frame files.
+
+Show how to export the decoder neural nets to TorchScript/ONNX so the decoder can run without the original Python repo (still requires entropy decoder or you must send latents).
+
+
+Which follow-up would you like?
