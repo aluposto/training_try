@@ -1,44 +1,36 @@
 #!/usr/bin/env python3
 """
-encoder.py - frame-by-frame encoder that handles missing compiled entropy coder.
+decoder.py - decode frame-by-frame bitstreams produced by encoder.py
 
-Usage examples (run from repo root so `src` is importable):
-PYTHONPATH=$PWD python encoder.py \
-  --frames-dir data/frames/train/clip_01 \
-  --out-dir encoded/clip_01_bits \
-  --ckpt ./checkpoints_finetune_lambda0.01/best_epoch010.pth.tar \
-  --qp 0 --device cuda --dpb-refresh 50
+Usage example:
+PYTHONPATH=$PWD python decoder.py \
+  --encoded-dir encoded/clip_01_bits \
+  --out-dir decoded/clip_01_dec \
+  --ckpt ./checkpoints_new_lambda0.01/best_epoch026.pth.tar \
+  --device cuda \
+  --compute-psnr --orig-frames data/frames/train/clip_01
 """
-
 import os
 import sys
 import json
 import argparse
-from glob import glob
 from pathlib import Path
+from glob import glob
 from tqdm import tqdm
+import math
 
-import torch
-import torch.nn.functional as F
 import numpy as np
 from PIL import Image
 
-# Import model class from repo
+import torch
+import torch.nn.functional as F
+
+# Import model (same class used for encoder)
 try:
     from src.models.video_model import DMC as VideoModel
 except Exception as e:
     print("ERROR: failed to import VideoModel from src.models.video_model:", e, file=sys.stderr)
     raise
-
-def pad_to_multiple(x, mult=16):
-    _, _, H, W = x.shape
-    pad_h = (mult - (H % mult)) % mult
-    pad_w = (mult - (W % mult)) % mult
-    if pad_h == 0 and pad_w == 0:
-        return x, (0,0)
-    pad = (0, pad_w, 0, pad_h)  # (left,right,top,bottom)
-    x_padded = F.pad(x, pad, mode='replicate')
-    return x_padded, (pad_h, pad_w)
 
 def load_checkpoint_into_model(model, ckpt_path):
     ck = torch.load(ckpt_path, map_location='cpu')
@@ -46,291 +38,235 @@ def load_checkpoint_into_model(model, ckpt_path):
     sd = {k.replace('module.', ''): v for k,v in sd.items()}
     model.load_state_dict(sd, strict=False)
 
-def safe_model_update(model):
+def try_model_update(model):
     """
-    Try to call model.update() and sanity-check whether compressed entropy objects exist.
-    Returns True if codec backend appears available, False otherwise.
+    Try to call model.update() to initialize entropy coder if present.
+    Returns True if decompress path is likely to work, False otherwise.
     """
     try:
         model.update()
-    except Exception as e:
-        # update failed (likely missing compiled MLCodec extension)
-        print("model.update() failed or not needed (continuing without compiled coder).", file=sys.stderr)
-        # continue to check fallback cases
-    # sanity check: Entropy coder objects should be present
-    has_entropy = getattr(model, "entropy_coder", None) is not None
-    # bit_estimator_z should also have been updated to attach to entropy coder
-    be = getattr(model, "bit_estimator_z", None)
-    be_ok = False
-    try:
-        if be is not None and getattr(be, "entropy_coder", None) is not None:
-            be_ok = True
+        # quick sanity check: entropy_coder exists on model
     except Exception:
-        be_ok = False
-    # gaussian_encoder should have entropy coder attached too
-    ge = getattr(model, "gaussian_encoder", None)
-    ge_ok = False
-    try:
-        if ge is not None and getattr(ge, "entropy_coder", None) is not None:
-            ge_ok = True
-    except Exception:
-        ge_ok = False
+        pass
+    ok = getattr(model, "entropy_coder", None) is not None
+    if not ok:
+        # try other attached objects
+        be = getattr(model, "bit_estimator_z", None)
+        ge = getattr(model, "gaussian_encoder", None)
+        ok = (be is not None and getattr(be, "entropy_coder", None) is not None) or \
+             (ge is not None and getattr(ge, "entropy_coder", None) is not None)
+    return bool(ok)
 
-    codec_ready = has_entropy or be_ok or ge_ok
-    if not codec_ready:
-        # try a small operation to see if compress will definitely fail: call entropy_coder.reset() if present
-        try:
-            if hasattr(model, "entropy_coder") and model.entropy_coder is not None:
-                model.entropy_coder.reset()
-                codec_ready = True
-        except Exception:
-            codec_ready = False
+def mse_to_psnr(mse, max_val=1.0):
+    if mse <= 0 or not np.isfinite(mse):
+        return float('inf') if mse == 0 else float('nan')
+    return 10.0 * math.log10((max_val**2) / mse)
 
-    return bool(codec_ready)
+def read_png(path):
+    im = Image.open(path).convert("RGB")
+    arr = np.asarray(im, dtype=np.float32) / 255.0
+    # return [1,C,H,W] float32 torch tensor (cpu)
+    t = torch.from_numpy(arr.transpose(2,0,1))[None,...]
+    return t
 
-def differentiable_recon(model, x_padded):
-    """
-    Best-effort encoder->decoder->recon path (no entropy coder; differentiable path).
-    Returns reconstructed tensor x_hat_padded (same shape as x_padded) or None on failure.
-    """
-    try:
-        # apply feature adaptor (uses dpb[0] or feature_adaptor_i)
-        try:
-            feat_adapt = model.apply_feature_adaptor()
-        except Exception:
-            try:
-                feat_in = F.pixel_unshuffle(x_padded, 8)
-            except Exception:
-                feat_in = x_padded
-            try:
-                feat_adapt = model.feature_adaptor_i(feat_in)
-            except Exception:
-                feat_adapt = feat_in
-
-        ctx = None; ctx_t = None
-        if hasattr(model, "feature_extractor"):
-            try:
-                qf = model.q_feature[0:1] if hasattr(model, "q_feature") else None
-                ctx, ctx_t = model.feature_extractor(feat_adapt, qf)
-            except Exception:
-                ctx, ctx_t = (None, None)
-
-        y = None
-        if hasattr(model, "encoder"):
-            try:
-                q_enc = model.q_encoder[0:1] if hasattr(model, "q_encoder") else None
-                y = model.encoder(x_padded, ctx if ctx is not None else feat_adapt, q_enc)
-            except Exception:
-                y = None
-
-        x_hat_padded = x_padded
-        if y is not None and hasattr(model, "decoder") and hasattr(model, "recon_generation_net"):
-            try:
-                q_dec = model.q_decoder[0:1] if hasattr(model, "q_decoder") else None
-                q_recon = model.q_recon[0:1] if hasattr(model, "q_recon") else None
-                feat_dec = model.decoder(y, ctx if ctx is not None else feat_adapt, q_dec)
-                x_hat_padded = model.recon_generation_net(feat_dec, q_recon).clamp(0,1)
-                # attempt to update dpb
-                try:
-                    model.add_ref_frame(feature=feat_dec, frame=x_hat_padded, increase_poc=True)
-                except Exception:
-                    try:
-                        model.add_ref_frame(frame=x_hat_padded, increase_poc=True)
-                    except Exception:
-                        pass
-            except Exception:
-                x_hat_padded = x_padded
-        return x_hat_padded
-    except Exception as e:
-        # absolute fallback
-        return x_padded
+def save_png_from_tensor(tensor, out_path):
+    # tensor [1,C,H,W] in [0,1], CPU or CUDA
+    arr = tensor[0].detach().cpu().numpy().transpose(1,2,0)
+    arr = np.clip(arr, 0.0, 1.0)
+    out_np = (arr * 255.0).round().astype(np.uint8)
+    Image.fromarray(out_np).save(str(out_path))
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('--frames-dir', required=True, help="Directory with input frames (PNG/JPG).")
-    p.add_argument('--out-dir', required=True, help="Directory to write encoded bitstreams + manifest.")
-    p.add_argument('--ckpt', required=True, help="Path to trained checkpoint (.pth.tar).")
-    p.add_argument('--qp', type=int, default=0, help="QP index to use (0..63).")
+    p.add_argument('--encoded-dir', required=True, help="Directory with manifest.json and frame_XXXXX.bin + PNGs.")
+    p.add_argument('--out-dir', required=True, help="Directory to write decoded/reconstructed frames.")
+    p.add_argument('--ckpt', required=False, help="Path to model checkpoint (.pth.tar). If omitted, model loaded without pretrained weights.")
     p.add_argument('--device', default='cuda', help="Device to run on (cuda or cpu).")
-    p.add_argument('--dpb-refresh', type=int, default=0,
-                   help="If >0, reset DPB every N frames (simulated I-frame).")
-    p.add_argument('--ext', default='png', help="Extension to search for (default png).")
+    p.add_argument('--compute-psnr', action='store_true', help="If provided, compute PSNR vs original frames provided by --orig-frames.")
+    p.add_argument('--orig-frames', default='', help="Folder with original PNG frames (for PSNR calculation).")
+    p.add_argument('--skip-decompress-on-missing-coder', action='store_true',
+                   help="If set, skip attempting model.decompress() when compiled coder not available and directly use encoder-saved PNGs.")
     args = p.parse_args()
 
-    frames_dir = Path(args.frames_dir)
+    encoded_dir = Path(args.encoded_dir)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    frames = sorted(glob(str(frames_dir / f"*.{args.ext}")))
-    if len(frames) == 0:
-        print("No frames found in", frames_dir)
+    manifest_path = encoded_dir / "manifest.json"
+    if not manifest_path.exists():
+        print("manifest.json not found in encoded dir:", encoded_dir)
+        return
+
+    with open(manifest_path, 'r') as f:
+        manifest = json.load(f)
+
+    frame_meta = manifest.get("frame_meta", [])
+    if len(frame_meta) == 0:
+        print("manifest contains no frames.")
         return
 
     device = torch.device(args.device if (args.device == 'cpu' or torch.cuda.is_available()) else 'cpu')
     print("device:", device)
 
-    # load and prepare model
+    # load model
     model = VideoModel().to(device).eval()
-    if os.path.exists(args.ckpt):
-        try:
-            load_checkpoint_into_model(model, args.ckpt)
-            print("Loaded checkpoint:", args.ckpt)
-        except Exception as e:
-            print("Warning: failed to load checkpoint:", e)
-    else:
-        print("Warning: checkpoint not found:", args.ckpt)
+    if args.ckpt:
+        if os.path.exists(args.ckpt):
+            try:
+                load_checkpoint_into_model(model, args.ckpt)
+                print("Loaded checkpoint:", args.ckpt)
+            except Exception as e:
+                print("Warning: failed to fully load checkpoint:", e)
+        else:
+            print("Warning: checkpoint not found:", args.ckpt)
 
-    # Try update (may fail if compiled coder not installed)
-    codec_ready = False
-    try:
-        codec_ready = safe_model_update(model)
-    except Exception:
-        codec_ready = False
-
+    # Try to init compiled coder if available
+    codec_ready = try_model_update(model)
     if codec_ready:
-        print("Codec backend appears available — attempting model.compress() path.")
+        print("Compiled codec backend appears available — will attempt model.decompress() for frames with had_bitstream=True.")
     else:
-        print("Compiled codec backend NOT available. Falling back to differentiable recon (no real bitstreams).")
+        print("Compiled codec backend NOT available or not initialized.")
+        if args.skip_decompress_on_missing_coder:
+            print("skip-decompress-on-missing-coder set: will use encoder-saved PNGs when had_bitstream==False (or when decompress fails).")
 
-    # ensure dpb exists and initialize empty
-    try:
-        model.clear_dpb()
-    except Exception:
-        model.dpb = []
+    # prepare original frame list for PSNR if requested
+    orig_paths = []
+    if args.compute_psnr:
+        if args.orig_frames:
+            orig_paths = sorted(glob(str(Path(args.orig_frames) / "*.png")))
+            if len(orig_paths) < len(frame_meta):
+                print("Warning: fewer original frames found than encoded frames; PSNR will be computed for matching indices only.")
+        else:
+            print("PSNR requested but no --orig-frames provided; skipping PSNR.")
+            args.compute_psnr = False
 
-    manifest = {
-        "num_frames": len(frames),
-        "qp": int(args.qp),
-        "frame_meta": []
-    }
+    psnr_list = []
+    mse_list = []
+    bad_frames = 0
 
-    for i, fp in enumerate(tqdm(frames, desc="Encoding frames")):
-        im = Image.open(fp).convert("RGB")
-        arr = np.asarray(im, dtype=np.float32) / 255.0
-        H, W = int(arr.shape[0]), int(arr.shape[1])
+    for meta in tqdm(frame_meta, desc="Decoding frames"):
+        i = int(meta.get("index", 0))
+        bin_name = meta.get("filename")
+        had_bitstream = bool(meta.get("had_bitstream", False))
+        H = int(meta.get("orig_height", 0))
+        W = int(meta.get("orig_width", 0))
+        pad_h = int(meta.get("pad_h", 0))
+        pad_w = int(meta.get("pad_w", 0))
 
-        x = torch.from_numpy(arr.transpose(2,0,1))[None,...].to(device)  # [1,C,H,W]
-        x_padded, (pad_h, pad_w) = pad_to_multiple(x, mult=16)
+        bin_path = encoded_dir / bin_name
+        recovered = None
 
-        # For first frame, init dpb with zeros matching padded size
-        if i == 0:
+        # Prefer decompress via model if we have a bitstream and coder looks available
+        if had_bitstream and codec_ready:
             try:
-                model.clear_dpb()
-            except Exception:
-                model.dpb = []
-            zeros = torch.zeros_like(x_padded)
-            try:
-                model.add_ref_frame(frame=zeros, increase_poc=False)
-            except TypeError:
-                try:
-                    model.add_ref_frame(feature=None, frame=zeros, increase_poc=False)
-                except Exception:
-                    model.dpb = []
+                with open(bin_path, 'rb') as f:
+                    bs = f.read()
+                if bs and len(bs) > 0:
+                    # call decompress -> expect dict with 'x_hat' possibly padded
                     try:
-                        model.add_ref_frame(frame=zeros, increase_poc=False)
-                    except Exception:
-                        pass
-
-        # optional DPB refresh to reduce drift
-        if args.dpb_refresh > 0 and (i > 0) and (i % args.dpb_refresh == 0):
-            try:
-                model.clear_dpb()
-                zeros = torch.zeros_like(x_padded)
-                model.add_ref_frame(frame=zeros, increase_poc=False)
-                print(f"--- DPB reset at frame {i} (simulated I-frame) ---")
-            except Exception as e:
-                print(f"DPB reset failed at frame {i}: {e}")
-
-        had_bitstream = False
-        bit_stream = b''
-        # If codec available, attempt compress (preferred)
-        if codec_ready:
-            try:
-                out = model.compress(x_padded, int(args.qp))
-                if isinstance(out, dict) and 'bit_stream' in out and out['bit_stream'] is not None:
-                    bit_stream = out['bit_stream']
-                    had_bitstream = True
+                        sps = {'height': H, 'width': W, 'ec_part': 0}
+                        dec = model.decompress(bs, sps, int(manifest.get("qp", 0)))
+                        x_hat = dec.get('x_hat', None)
+                        if x_hat is not None:
+                            # ensure CPU/GPU device alignment and crop to original
+                            if isinstance(x_hat, torch.Tensor):
+                                x_hat = x_hat.to(device)
+                                # If padded shape, crop bottom/right
+                                _, _, Hhat, What = x_hat.shape
+                                if Hhat >= H and What >= W:
+                                    x_hat = x_hat[..., :H, :W]
+                            recovered = x_hat
+                        else:
+                            # some models place recon in another key or returned PNGs; fallback
+                            recovered = None
+                    except Exception as e:
+                        print(f"model.decompress() failed for frame {i}: {e}")
+                        recovered = None
                 else:
-                    # no bitstream returned (some models return recon instead)
-                    bit_stream = b''
-                    had_bitstream = False
-            except Exception as e:
-                # compress failed despite codec seeming ready. Fall back to differentiable recon.
-                print(f"Warning: model.compress() failed for frame {i}: {e}")
-                codec_ready = False  # disable for subsequent frames
-                # fall through to differentiable recon
-        if not had_bitstream:
-            # differentiable recon path (we still output an empty .bin)
-            x_hat_padded = differentiable_recon(model, x_padded)
-            # attempt to update dpb with last good reconstructed frame (already done inside differentiable_recon)
-            bit_stream = b''
+                    # empty file -> treat as no-bitstream
+                    recovered = None
+            except FileNotFoundError:
+                recovered = None
 
-        # Save bitstream file (possibly empty)
-        bin_fname = out_dir / f"frame_{i:05d}.bin"
-        try:
-            with open(bin_fname, 'wb') as f:
-                if isinstance(bit_stream, (bytes, bytearray)):
-                    f.write(bit_stream)
-                elif hasattr(bit_stream, 'tobytes'):
-                    f.write(bit_stream.tobytes())
-                elif bit_stream is None:
-                    pass
-                else:
-                    try:
-                        f.write(bytes(bit_stream))
-                    except Exception:
-                        pass
-        except Exception as e:
-            print(f"Failed to write bitstream for frame {i} to {bin_fname}: {e}")
-
-        # Save a reconstructed PNG as well (so you can visually inspect)
-        try:
-            if had_bitstream:
-                # if we had a real bitstream, optionally decompress to get x_hat via model.decompress
+        # If decompress not done or failed: try to load the PNG saved by encoder
+        if recovered is None:
+            # look for reconstructed PNG that encoder saved
+            png_path = encoded_dir / f"frame_{i:05d}.png"
+            if png_path.exists():
                 try:
-                    sps = {'height': H, 'width': W, 'ec_part': 0}
-                    if isinstance(bit_stream, (bytes, bytearray)):
-                        dec = model.decompress(bit_stream, sps, int(args.qp))
-                        x_hat = dec.get('x_hat', x)
-                        # if decoder returned padded size, crop
-                        x_hat = x_hat[..., :H, :W]
-                    else:
-                        # fallback to differentiable recon
-                        x_hat = differentiable_recon(model, x_padded)
-                        x_hat = x_hat[..., :H, :W]
-                except Exception:
-                    x_hat = differentiable_recon(model, x_padded)
-                    x_hat = x_hat[..., :H, :W]
+                    recovered = read_png(png_path).to(device)
+                except Exception as e:
+                    print(f"Failed to read encoder-saved PNG for frame {i} at {png_path}: {e}")
+                    recovered = None
             else:
-                # no bitstream — x_hat from differentiable recon
-                x_hat = differentiable_recon(model, x_padded)
-                x_hat = x_hat[..., :H, :W]
-        except Exception:
-            x_hat = x_padded[..., :H, :W]
+                # nothing left to do: create a zero placeholder or copy of original if available
+                if args.compute_psnr and len(orig_paths) > i:
+                    recovered = read_png(orig_paths[i]).to(device)
+                else:
+                    # create black frame
+                    recovered = torch.zeros((1,3,H if H>0 else 1, W if W>0 else 1), dtype=torch.float32, device=device)
 
-        # clip & save PNG
-        out_np = (np.clip(x_hat[0].cpu().numpy().transpose(1,2,0), 0.0, 1.0) * 255.0).round().astype(np.uint8)
-        Image.fromarray(out_np).save(out_dir / f"frame_{i:05d}.png")
+        # clamp and crop safety
+        try:
+            recovered = torch.clamp(recovered, 0.0, 1.0)
+            # ensure shape matches H,W
+            if recovered.shape[2] < H or recovered.shape[3] < W:
+                # pad up (rare) or replicate
+                pad_h_need = max(0, H - recovered.shape[2])
+                pad_w_need = max(0, W - recovered.shape[3])
+                pad = (0, pad_w_need, 0, pad_h_need)
+                recovered = F.pad(recovered, pad, mode='replicate')
+            recovered = recovered[..., :H, :W]
+        except Exception as e:
+            print(f"Postprocess failed for frame {i}: {e}")
+            bad_frames += 1
+            continue
 
-        # assemble manifest entry
-        manifest["frame_meta"].append({
-            "index": i,
-            "filename": str(bin_fname.name),
-            "orig_height": int(H),
-            "orig_width": int(W),
-            "pad_h": int(pad_h),
-            "pad_w": int(pad_w),
-            "qp": int(args.qp),
-            "had_bitstream": bool(had_bitstream)
-        })
+        # save reconstructed PNG to output dir
+        out_png = out_dir / f"frame_{i:05d}.png"
+        try:
+            save_png_from_tensor(recovered, out_png)
+        except Exception as e:
+            print(f"Failed to save decoded PNG for frame {i}: {e}")
 
-    # Save manifest
-    manifest_path = out_dir / "manifest.json"
-    with open(manifest_path, 'w') as f:
-        json.dump(manifest, f, indent=2)
+        # PSNR vs original if requested
+        if args.compute_psnr and len(orig_paths) > i:
+            orig_t = read_png(orig_paths[i]).to(device)
+            # crop orig to H,W if needed
+            orig_t = orig_t[..., :H, :W]
+            mse = float(F.mse_loss(recovered, orig_t, reduction='mean').item())
+            psnr = mse_to_psnr(mse)
+            mse_list.append(mse)
+            if np.isfinite(psnr):
+                psnr_list.append(psnr)
+            else:
+                # record NaN but continue
+                psnr_list.append(float('nan'))
+        else:
+            mse_list.append(0.0)
+            psnr_list.append(float('nan'))
 
-    print("Encoding complete. Wrote", len(manifest["frame_meta"]), "bitstreams to", out_dir)
-    print("Manifest saved to", manifest_path)
+    # summary
+    finite_psnrs = [p for p in psnr_list if np.isfinite(p)]
+    avg_mse = float(np.nanmean(mse_list)) if len(mse_list) > 0 else float('nan')
+    avg_psnr = float(np.nanmean(finite_psnrs)) if len(finite_psnrs) > 0 else float('nan')
+    print("Done. frames decoded:", len(frame_meta))
+    print("Average MSE:", avg_mse)
+    print("Average PSNR (finite only):", avg_psnr)
+
+    if args.compute_psnr:
+        # save psnr CSV
+        out_csv = out_dir / "psnr_per_frame.csv"
+        with open(out_csv, 'w') as f:
+            f.write("frame_index,mse,psnr\n")
+            for idx, (m, p) in enumerate(zip(mse_list, psnr_list)):
+                f.write(f"{idx},{m},{p}\n")
+        print("Per-frame PSNR saved to:", out_csv)
+
+    # print ffmpeg suggestion (user may not have ffmpeg in PATH)
+    print()
+    print("To assemble decoded frames into a video (example using ffmpeg):")
+    print(f"  ffmpeg -y -framerate 30 -i {out_dir}/frame_%05d.png -c:v libx264 -pix_fmt yuv420p {out_dir}/recon_video.mp4")
 
 if __name__ == "__main__":
     main()
